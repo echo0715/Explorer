@@ -1,33 +1,21 @@
 import argparse
-from ast import parse
 import json
 import os
 import random
 from pathlib import Path
 
-import Levenshtein
 import torch
 from accelerate import Accelerator
-from accelerate.utils import gather_object
-from datasets import load_dataset, load_from_disk
-from tqdm import tqdm
-import transformers
-import traceback
-
 from transformers import (
-    AutoModelForCausalLM,
     AutoProcessor,
-    BitsAndBytesConfig,
     Trainer,
     TrainingArguments,
-    Qwen2VLForConditionalGeneration,
-    AutoTokenizer,
-    TrainerCallback,
+    Qwen2_5_VLForConditionalGeneration,
 )
 
 from PIL import Image
 import re
-from train_utils import create_stepwise_dataset_qwen, WebTrajDataOrderedQwenCollator
+from train_utils import create_branch_generated_dataset
 
 random.seed(123937)
 
@@ -61,10 +49,10 @@ DS_CONFIG_DICT = {
 
 
 def create_model(model_name_or_path, use_flash_attention=False):
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_name_or_path,
         torch_dtype=torch.float16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="flash_attention_2" if use_flash_attention else None,
     )
 
     return model
@@ -115,81 +103,52 @@ USER_MESSAGE = """The instruction is to {}.
       Think about what you need to do with current screen, and output the action in the required format in the end. """
 
 
-class WebTrajDataStepWiseCollator:
-    def __init__(self, args, processor, root, max_steps=1):
+class BranchGeneratedQwenCollator:
+    """
+    Data collator for training directly on branch-generated trajectories, one step per example.
+
+    Expects each dataset example to have the following fields (as created by
+    `create_branch_generated_dataset`):
+        - task_description: overall task description for the branch
+        - branch_dir: absolute path to the branch directory
+        - history: concatenated reasoning strings from all previous steps in this branch
+        - step: a dict describing the current step, with:
+            - step: integer step id (1-based)
+            - is_replay: whether this is a replay step
+            - reasoning: optional natural language reasoning
+            - action_dict: high-level action dictionary
+    """
+
+    def __init__(self, args, processor, max_steps=1):
         self.max_steps = max_steps
         self.processor = processor
-        self.root = root
         self.args = args
 
     def __call__(self, data):
-        assert len(data) == 1, f"Phi-3-V only supports batch_size == 1, got {len(data)}"
-        data = data[0]
-        overall_task = data["summary_abstract"]
+        assert (
+            len(data) == 1
+        ), f"BranchGeneratedQwenCollator only supports batch_size == 1, got {len(data)}"
+        example = data[0]
+
+        overall_task = example["task_description"]
+        action_history = example.get("history", "")
 
         if self.args.use_google_search:
             system_message = SYSTEM_MESSAGE_GS
         elif self.args.use_nogoto_gs_format:
             system_message = SYSTEM_MESSAGE_NOGOTO_GS
         else:
-            return NotImplementedError
+            system_message = SYSTEM_MESSAGE_GS
 
         system_message = {
             "role": "system",
             "content": system_message,
         }
 
-        # print(system_message)
+        # Each dataset example corresponds to exactly one step.
+        step = example["step"]
 
-        sampled_step_id = random.randint(0, len(data["actions"]) - 1)
-        action_history = ""
-        if sampled_step_id > 0:
-            action_history = [
-                data["actions"][step_id]["step_action_nl"]
-                for step_id in range(sampled_step_id)
-            ]
-            action_history = "\n".join(action_history)
-
-        if self.args.use_new_format:
-            if data["actions"][sampled_step_id]["acc_tree_visible_before"]:
-                acc_tree = data["actions"][sampled_step_id]["acc_tree_visible_before"]
-
-                if (
-                    "acc_tree_other_before" in data["actions"][sampled_step_id]
-                    and data["actions"][sampled_step_id]["acc_tree_other_before"]
-                    and len(data["actions"][sampled_step_id]["acc_tree_other_before"])
-                    > 0
-                ):
-                    acc_tree = (
-                        acc_tree
-                        + data["actions"][sampled_step_id]["acc_tree_other_before"]
-                    )
-            else:
-                acc_tree = data["actions"][sampled_step_id]["acc_tree_before"]
-
-            try:
-                if acc_tree and self.args.max_len_acctree > 0:
-                    acc_tree = acc_tree[: self.args.max_len_acctree]
-                else:
-                    acc_tree = ""
-            except:
-                print(data["actions"][sampled_step_id])
-        else:
-            acc_tree = data["actions"][sampled_step_id]["acc_tree_before"][:4096]
-
-        if self.args.use_new_format:
-            image_path = os.path.join(
-                self.root, data["folder"], f"screenshot_som_crop_{sampled_step_id}.png"
-            )
-        else:
-            image_path = os.path.join(
-                self.root, data["folder"], f"screenshot_som_{sampled_step_id}.png"
-            )
-
-        if not os.path.exists(image_path):
-            image_path = os.path.join(
-                data["folder"], f"screenshot_som_{sampled_step_id}.png"
-            )
+        acc_tree = ""
 
         prompt_message = {
             "role": "user",
@@ -203,6 +162,23 @@ class WebTrajDataStepWiseCollator:
             ],
         }
 
+        branch_dir = example["branch_dir"]
+
+        # Determine which screenshot to use.
+        # - For replay steps (initial segment), use step_{step}_replay.png if available.
+        # - For non-replay steps, use step_{step}.png.
+        is_replay = step.get("is_replay", False)
+        step_id = step.get("step")
+
+        if is_replay:
+            image_path = os.path.join(
+                branch_dir, "screenshots", f"step_{step_id}_replay.png"
+            )
+        else:
+            image_path = os.path.join(
+                branch_dir, "screenshots", f"step_{step_id}.png"
+            )
+
         image = Image.open(image_path)
 
         width, height = image.size
@@ -211,13 +187,11 @@ class WebTrajDataStepWiseCollator:
         if width > max_width:
             crop_box = (0, 0, max_width, height)
             image = image.crop(crop_box)
-            # print('cropped to {}'.format(image.size))
 
         messages = [system_message, prompt_message]
         prompt = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        # print('prompt = {}'.format(prompt))
 
         batch = self.processor(
             text=[prompt], images=[image], padding=True, return_tensors="pt"
@@ -227,101 +201,18 @@ class WebTrajDataStepWiseCollator:
         labels = [torch.tensor([-100] * len(batch["input_ids"][0])).unsqueeze(0)]
         image_grid_thw = batch["image_grid_thw"]
 
-        answer_grounded = data["actions"][sampled_step_id]["new_action_grounded"]
-
-        if not answer_grounded:
-            answer_grounded = data["actions"][sampled_step_id]["action_grounded"]
-
-        answer_type = answer_grounded.strip().split(" ")[0]
-        answer_nl = data["actions"][sampled_step_id]["step_action_nl"]
-
-        try:
-            if answer_type == "click":
-                match = re.search(r"click ?\[(\d+)\]", answer_grounded)
-                element_id = match.group(1)
-                answer = {
-                    "action": answer_type,
-                    "action_natural_language": answer_nl,
-                    "idx": element_id,
-                }
-            elif answer_type == "type":
-                match = re.search(r"type ?\[(\d+)\] ?\[(.+)\]", answer_grounded)
-                element_id, text = (
-                    match.group(1),
-                    match.group(2),
-                )
-                answer = {
-                    "action": answer_type,
-                    "action_natural_language": answer_nl,
-                    "idx": element_id,
-                    "value": text,
-                }
-            elif answer_type == "select":
-                match = re.search(r"select ?\[(\d+)\] ?\[(.+)\]", answer_grounded)
-                element_id, text = (
-                    match.group(1),
-                    match.group(2),
-                )
-                answer = {
-                    "action": answer_type,
-                    "action_natural_language": answer_nl,
-                    "idx": element_id,
-                    "value": text,
-                }
-            elif answer_type == "scroll":
-                match = re.search(r"scroll ?\[?(up|down)\]?", answer_grounded)
-                direction = match.group(1)
-                answer = {
-                    "action": answer_type,
-                    "action_natural_language": answer_nl,
-                    "idx": direction,
-                }
-            elif answer_type == "goto":
-                match = re.search(r"goto ?\[(.+)\]", answer_grounded)
-                url = match.group(1)
-                answer = {
-                    "action": answer_type,
-                    "action_natural_language": answer_nl,
-                    "value": url,
-                }
-            elif answer_type == "google_search":
-                answer_grounded = answer_grounded.replace("\n", "")
-                match = re.search(r"google_search ?\[(.+)\]", answer_grounded)
-                query = match.group(1)
-                answer = {
-                    "action": answer_type,
-                    "action_natural_language": answer_nl,
-                    "value": query,
-                }
-            else:
-                answer = {
-                    "action": answer_type,
-                    "action_natural_language": answer_nl,
-                    "idx": "",
-                }
-        except:
-            answer = {
-                "action": answer_type,
-                "action_natural_language": answer_nl,
-                "idx": "",
-            }
-            print(
-                "exception: answer = {}, answer_grounded = {}".format(
-                    answer, answer_grounded
-                )
-            )
-            print("actions = {}".format(data["actions"]))
-            traceback.print_exc()
-
-        # print('answer = {}'.format(answer))
-        # print('answer_grounded = {}, answer = {}'.format(answer_grounded, answer))
-
-        answer = f"{answer}<|im_end|>\n<|endoftext|>"
+        # Supervised target: model should output both reasoning and action_dict.
+        target = {
+            "reasoning": step.get("reasoning", ""),
+            "action": step.get("action_dict", {}),
+        }
+        answer = f"{json.dumps(target, ensure_ascii=False)}<|im_end|>\n<|endoftext|>"
         answer_input_ids = self.processor.tokenizer(
             answer, add_special_tokens=False, return_tensors="pt"
         )["input_ids"]
         input_ids.append(answer_input_ids)
         labels.append(answer_input_ids)
+
         assert "pixel_values" in batch, f"Image not found: {image_path}!!!\n"
 
         input_ids = torch.cat(input_ids, dim=1)
@@ -337,7 +228,6 @@ class WebTrajDataStepWiseCollator:
             "image_grid_thw": image_grid_thw,
             "attention_mask": attention_mask,
         }
-        # print(batch)
 
         return batch
 
@@ -362,23 +252,13 @@ def main():
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        default="Qwen/Qwen2-VL-7B-Instruct",
+        default="Qwen/Qwen2.5-VL-7B-Instruct",
         help="Model name or path to load from",
     )
-    parser.add_argument(
-        "--full_train", action="store_true", help="Use full training dataset (DocVQA)"
-    )
-    parser.add_argument("--stage", type=int, help="DS train stage")
     parser.add_argument(
         "--use_flash_attention", action="store_true", help="Use Flash Attention"
     )
     parser.add_argument("--bf16", action="store_true", help="Use BF16")
-    parser.add_argument("--train_dir", type=str, help="train data dir", default="")
-    parser.add_argument(
-        "--train_dir_order", type=str, help="train data dir", default=""
-    )
-
-    parser.add_argument("--train_data_dir", type=str, help="train data dir", default="")
     parser.add_argument(
         "--output_dir", type=str, default="./output/", help="Output directory"
     )
@@ -400,18 +280,6 @@ def main():
         "--tensorboard-logging", action="store_true", help="log to tensorboard"
     )
     parser.add_argument(
-        "--order_all_steps",
-        action="store_true",
-        help="enforce all steps are seen in first epoch in same order",
-    )
-    parser.add_argument("--report_to", type=str, default="wandb", help="report to")
-    parser.add_argument(
-        "--use-new-format", action="store_true", help="use new format for traj data"
-    )
-    parser.add_argument(
-        "--max-len-acctree", type=int, default=-1, help="max len acctree"
-    )
-    parser.add_argument(
         "--use-google-search",
         action="store_true",
         help="add google search in action space and prompt",
@@ -420,6 +288,16 @@ def main():
         "--use-nogoto-gs-format",
         action="store_true",
         help="remove gs and goto from prompt",
+    )
+    parser.add_argument(
+        "--branch_generated_root",
+        type=str,
+        default="",
+        help=(
+            "Root directory containing branch-generated trajectories "
+            "(each subdirectory should contain metadata.json, trajectory.jsonl, and screenshots/). "
+            "If provided, this will be used to build the training dataset instead of --train_dir."
+        ),
     )
 
     args = parser.parse_args()
@@ -435,18 +313,12 @@ def main():
             use_flash_attention=args.use_flash_attention,
         )
 
-    if args.order_all_steps:
-        if not os.path.exists(args.train_dir_order):
-            train_dataset = load_from_disk(args.train_dir)
-
-            train_dataset = create_stepwise_dataset_qwen(
-                args, args.train_data_dir, train_dataset, processor
-            )
-            train_dataset.save_to_disk(args.train_dir_order)
-        else:
-            train_dataset = load_from_disk(args.train_dir_order)
-    else:
-        train_dataset = load_from_disk(args.train_dir)
+    # Build training dataset from branch-generated trajectories
+    if not args.branch_generated_root:
+        raise ValueError(
+            "You must provide --branch_generated_root pointing to the branch_generated directory."
+        )
+    train_dataset = create_branch_generated_dataset(args.branch_generated_root)
 
     print("train_dataset:", train_dataset)
     print("len(train_dataset):", len(train_dataset))
@@ -502,12 +374,7 @@ def main():
         dataloader_prefetch_factor=1,  # 2,
     )
 
-    if args.order_all_steps:
-        data_collator = WebTrajDataOrderedQwenCollator(processor)
-    else:
-        data_collator = WebTrajDataStepWiseCollator(
-            args, processor, args.train_data_dir, args.model_name_or_path
-        )
+    data_collator = BranchGeneratedQwenCollator(args, processor)
 
     # eval before fine-tuning
     out_path = Path(training_args.output_dir)
