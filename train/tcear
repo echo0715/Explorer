@@ -1,0 +1,57 @@
+
+------------------------------ /gpfs/radev/apps/avx512/manual/modules -------------------------------
+   PyTorch/2.3.0a0-foss-2022b-CUDA-12.2.2 ([1;31mg[0m,D)    torchvision/0.18.0a0-foss-2022b-CUDA-12.2.2 ([1;31mg[0m,D)
+
+------------------------------- /gpfs/radev/apps/avx512/modules/base --------------------------------
+   gpu_burn/20231110-GCCcore-12.2.0-CUDA-12.0.0 ([1;31mg[0m)
+
+-------------------------------- /gpfs/radev/apps/avx512/modules/ai ---------------------------------
+   PyTorch/2.0.1-foss-2022b-CUDA-12.1.1 ([1;31mg[0m)    ollama/0.6.0-GCCcore-12.2.0-CUDA-12.1.1  ([1;31mg[0m)
+   PyTorch/2.1.2-foss-2022b-CUDA-12.1.1 ([1;31mg[0m)    ollama/0.11.6-GCCcore-12.2.0-CUDA-12.8.0 ([1;31mg[0m,D)
+   jax/0.6.2-gfbf-2024a-CUDA-12.6.0     ([1;31mg[0m)
+
+-------------------------------- /gpfs/radev/apps/avx512/modules/bio --------------------------------
+   GROMACS/2023.3-foss-2022b-CUDA-12.0.0 ([1;31mg[0m)
+
+----------------------------- /gpfs/radev/apps/avx512/modules/compiler ------------------------------
+   Clang/18.1.8-GCCcore-13.3.0-CUDA-12.6.0 ([1;31mg[0m,D)    NVHPC/23.1-CUDA-12.0.0 ([1;31mg[0m)
+
+-------------------------------- /gpfs/radev/apps/avx512/modules/lib --------------------------------
+   FlexiBLAS/3.2.1-NVHPC-23.1-CUDA-12.0.0
+   NCCL/2.16.2-GCCcore-12.2.0-CUDA-12.0.0     ([1;31mg[0m)
+   NCCL/2.22.3-GCCcore-13.3.0-CUDA-12.6.0     ([1;31mg[0m,D)
+   UCC-CUDA/1.1.0-GCCcore-12.2.0-CUDA-12.0.0  ([1;31mg[0m)
+   UCX-CUDA/1.13.1-GCCcore-12.2.0-CUDA-12.0.0 ([1;31mg[0m)
+   UCX-CUDA/1.13.1-GCCcore-12.2.0-CUDA-12.1.1 ([1;31mg[0m)
+   UCX-CUDA/1.13.1-GCCcore-12.2.0-CUDA-12.2.2 ([1;31mg[0m)
+   UCX-CUDA/1.16.0-GCCcore-13.3.0-CUDA-12.6.0 ([1;31mg[0m,D)
+
+------------------------------- /gpfs/radev/apps/avx512/modules/math --------------------------------
+   magma/2.7.2-foss-2022b-CUDA-12.1.1 ([1;31mg[0m)    magma/2.7.2-foss-2022b-CUDA-12.2.2 ([1;31mg[0m,D)
+
+------------------------------ /gpfs/radev/apps/avx512/modules/numlib -------------------------------
+   FFTW/3.3.10-NVHPC-23.1-CUDA-12.0.0     (D)    cuDNN/8.9.2.26-CUDA-12.1.1 ([1;31mg[0m)
+   OpenBLAS/0.3.21-NVHPC-23.1-CUDA-12.0.0        cuDNN/8.9.2.26-CUDA-12.2.2 ([1;31mg[0m)
+   cuDNN/8.8.0.121-CUDA-12.0.0            ([1;31mg[0m)    cuDNN/9.1.0.70-CUDA-12.2.2 ([1;31mg[0m)
+   cuDNN/8.9.2.26-CUDA-11.8.0             ([1;31mg[0m)    cuDNN/9.5.0.50-CUDA-12.6.0 ([1;31mg[0m,D)
+
+------------------------------ /gpfs/radev/apps/avx512/modules/system -------------------------------
+   CUDA/11.8.0 ([1;31mg[0m)    CUDA/12.1.1 ([1;31mg[0m)    CUDA/12.4.1 ([1;31mg[0m)    CUDA/12.6.3 ([1;31mg[0m)
+   CUDA/12.0.0 ([1;31mg[0m)    CUDA/12.2.2 ([1;31mg[0m)    CUDA/12.6.0 ([1;31mg[0m)    CUDA/12.8.0 ([1;31mg[0m,D)
+
+-------------------------------- /gpfs/radev/apps/avx512/modules/vis --------------------------------
+   torchvision/0.15.2-foss-2022b-CUDA-12.1.1 ([1;31mg[0m)    torchvision/0.16.2-foss-2022b-CUDA-12.1.1 ([1;31mg[0m)
+
+  Where:
+   [1;31mg[0m:  built for GPU
+   D:  Default Module
+
+If the avail list is too long consider trying:
+
+"module --default avail" or "ml -d av" to just list the default modules.
+"module overview" or "ml ov" to display the number of modules for each name.
+
+Use "module spider" to find all possible modules and extensions.
+Use "module keyword key1 key2 ..." to search for all possible modules matching any of the "keys".
+
+

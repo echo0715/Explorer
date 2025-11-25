@@ -35,14 +35,24 @@ def create_branch_generated_dataset(branch_root: str) -> Dataset:
             - step: original integer step id from the trajectory (1-based)
             - is_replay: True if this step comes from the initial replay segment, False otherwise
             - reasoning: optional natural language reasoning for the step
+            - action_proposal: optional short imperative description of the action
             - action_dict: the high-level action dictionary used by the agent
             - reward: scalar reward
             - done: bool flag
+        - all_steps: list of dicts for all steps in this branch (same schema as `step`)
+        - current_step_idx: integer index into `all_steps` for the current step
     """
     examples = []
 
     if not os.path.isdir(branch_root):
         raise ValueError(f"branch_root does not exist or is not a directory: {branch_root}")
+
+    # ------------------------------------------------------------------
+    # First pass: collect all branches and their metadata so we can
+    # determine, for LibreOffice domains, which branches should KEEP
+    # replay steps and which should DROP them.
+    # ------------------------------------------------------------------
+    branch_infos = []
 
     for dir_name in sorted(os.listdir(branch_root)):
         dir_path = os.path.join(branch_root, dir_name)
@@ -57,7 +67,6 @@ def create_branch_generated_dataset(branch_root: str) -> Dataset:
             # Skip directories that do not contain both metadata and trajectory
             continue
 
-        # Load metadata.json to get task descriptions
         try:
             with open(metadata_path, "r") as f:
                 metadata = json.load(f)
@@ -65,8 +74,76 @@ def create_branch_generated_dataset(branch_root: str) -> Dataset:
             print(f"[create_branch_generated_dataset] Failed to read {metadata_path}: {e}")
             continue
 
-        task_description = metadata.get("generated_task_description_from_vllm", "")
+        branch_infos.append(
+            {
+                "dir_path": dir_path,
+                "metadata_path": metadata_path,
+                "traj_path": traj_path,
+                "screenshots_dir": screenshots_dir,
+                "metadata": metadata,
+            }
+        )
 
+    # Map from branch dir to whether we should keep replay steps when
+    # building the training data. Default is True (keep replays).
+    include_replay_for_branch: dict[str, bool] = {}
+
+    # Only apply the "drop replay steps for non-max branches" logic to
+    # LibreOffice domains, grouped by original_task_id.
+    target_domains = {"libreoffice_calc", "libreoffice_impress", "libreoffice_writer"}
+    branches_by_original_id: dict[str, list[dict]] = {}
+
+    for info in branch_infos:
+        metadata = info["metadata"]
+        domain = metadata.get("domain")
+        if domain not in target_domains:
+            continue
+
+        original_task_id = metadata.get("original_task_id")
+        if not original_task_id:
+            continue
+
+        branch_after_step_raw = metadata.get("branch_after_step")
+        branch_after_step_int = int(branch_after_step_raw)
+
+        info["branch_after_step_int"] = branch_after_step_int
+        # Group branches that share the same original_task_id
+        branches_by_original_id.setdefault(str(original_task_id), []).append(info)
+
+    for _task_id, infos in branches_by_original_id.items():
+        max_branch_step = max(i["branch_after_step_int"] for i in infos)
+        for info in infos:
+            dir_path = info["dir_path"]
+            include_replay_for_branch[dir_path] = info["branch_after_step_int"] == max_branch_step
+
+    # ------------------------------------------------------------------
+    # Second pass: actually build per-step training examples, using the
+    # include_replay_for_branch map to optionally drop replay steps for
+    # non-max LibreOffice branches.
+    # ------------------------------------------------------------------
+    for info in branch_infos:
+        dir_path = info["dir_path"]
+        metadata = info["metadata"]
+        traj_path = info["traj_path"]
+        screenshots_dir = info["screenshots_dir"]
+
+        # For LibreOffice domains that are not the max-branch for a given
+        # original_task_id, we drop replay steps from training and history.
+        # Look up this flag before deciding which task description to use.
+        include_replay = include_replay_for_branch.get(dir_path, True)
+
+        domain = metadata.get("domain")
+        # For non-max LibreOffice branches (where we drop replay steps),
+        # use the human-edited `new_task_description` instead of the
+        # VLLM-generated one. For all other branches, keep the original
+        # behavior.
+        if not include_replay and domain in target_domains:
+            task_description = metadata.get(
+                "new_task_description",
+                metadata.get("generated_task_description_from_vllm", ""),
+            )
+        else:
+            task_description = metadata.get("generated_task_description_from_vllm", "")
         num_replay_steps = int(metadata.get("num_replay_steps", 0))
 
         # First, parse all steps for this branch.
@@ -88,6 +165,14 @@ def create_branch_generated_dataset(branch_root: str) -> Dataset:
                     # Determine whether this is part of the initial replay segment.
                     # By construction, all replay steps come first in the trajectory.
                     is_replay = line_index <= num_replay_steps
+
+                    # For non-max LibreOffice branches we skip replay steps entirely:
+                    #   - they will not get supervised targets
+                    #   - they will not appear in `all_steps` or textual history
+                    # The collator will still use the last replay screenshot as
+                    # the initial observation via its screenshot-loading logic.
+                    if is_replay and not include_replay:
+                        continue
 
                     # Normalize action_dict:
                     # - use record["action_dict"] if present
@@ -114,6 +199,10 @@ def create_branch_generated_dataset(branch_root: str) -> Dataset:
                         "step": step_id,
                         "is_replay": is_replay,
                         "reasoning": record.get("reasoning", ""),
+                        # Short imperative description of the action, if present.
+                        # This is preferred over `reasoning` when building the
+                        # supervised "Action: ..." target during training.
+                        "action_proposal": record.get("action_proposal", ""),
                         "action_dict": action_dict,
                         "reward": record.get("reward", 0),
                         "done": record.get("done", False),
@@ -136,16 +225,41 @@ def create_branch_generated_dataset(branch_root: str) -> Dataset:
         # Flatten into one example per step, and precompute textual history for each.
         history_reasonings: list[str] = []
         abs_branch_dir = os.path.abspath(dir_path)
-        for step in steps:
+        num_steps = len(steps)
+        for idx, step in enumerate(steps):
             history_text = "\n".join(r for r in history_reasonings if r)
-            examples.append(
-                {
-                    "task_description": task_description,
-                    "branch_dir": abs_branch_dir,
-                    "history": history_text,
-                    "step": step.copy(),
-                }
-            )
+            is_last_step = idx == num_steps - 1
+
+            # For the final step in the trajectory, force a standardized
+            # action_proposal so the model always sees a clear terminal message.
+            if is_last_step:
+                step = step.copy()
+                step["action_proposal"] = "The task is completed successfully."
+                steps[idx] = step
+
+            # Skip training examples whose action_proposal is empty/missing.
+            # These steps can still appear in `all_steps` and contribute to
+            # history/context, but we do not create a supervised target for them.
+            action_proposal = step.get("action_proposal") or ""
+            if isinstance(action_proposal, str):
+                action_proposal = action_proposal.strip()
+            # Skip creating a supervised example for steps whose action_proposal
+            # is empty, EXCEPT for the final step in the trajectory. We keep the
+            # last step even if its action_proposal is empty so the model can
+            # still learn from terminal / DONE steps.
+            if action_proposal or is_last_step:
+                examples.append(
+                    {
+                        "task_description": task_description,
+                        "branch_dir": abs_branch_dir,
+                        "history": history_text,
+                        "step": step.copy(),
+                        # Provide full trajectory and index so the collator can
+                        # reconstruct multi-step, multi-image chat histories.
+                        "all_steps": steps,
+                        "current_step_idx": idx,
+                    }
+                )
 
             r = step.get("reasoning", "")
             if r:

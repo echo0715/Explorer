@@ -1,0 +1,38 @@
+
+-------------------------------------------------------------------------------------
+  CUDA:
+-------------------------------------------------------------------------------------
+    Description:
+      CUDA (formerly Compute Unified Device Architecture) is a parallel computing
+      platform and programming model created by NVIDIA and implemented by the
+      graphics processing units (GPUs) that they produce. CUDA gives developers
+      access to the virtual instruction set and memory of the parallel computational
+      elements in CUDA GPUs.
+
+     Versions:
+        CUDA/11.8.0
+        CUDA/12.0.0
+        CUDA/12.1.1
+        CUDA/12.2.2
+        CUDA/12.4.1
+        CUDA/12.6.0
+        CUDA/12.6.3
+        CUDA/12.8.0
+     Other possible modules matches:
+        UCC-CUDA  UCX-CUDA
+
+-------------------------------------------------------------------------------------
+  To find other possible module matches execute:
+
+      $ module -r spider '.*CUDA.*'
+
+-------------------------------------------------------------------------------------
+  For detailed information about a specific "CUDA" package (including how to load the modules) use the module's full name.
+  Note that names that have a trailing (E) are extensions provided by other modules.
+  For example:
+
+     $ module spider CUDA/12.8.0
+-------------------------------------------------------------------------------------
+
+ 
+
