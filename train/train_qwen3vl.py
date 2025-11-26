@@ -197,12 +197,12 @@ For each function call, return a json object with function name and arguments wi
 # Response format
 
 Response format for every step:
-1) Action: a short imperative describing what to do in the UI.
+1) Reasoning: a short reasoning describe the thinking and the action to take in the UI.
 2) A single <tool_call>...</tool_call> block containing only the JSON: {"name": <function-name>, "arguments": <args-json-object>}.
 
 Rules:
-- Output exactly in the order: Action, <tool_call>.
-- Be brief: one sentence for Action.
+- Output exactly in the order: Reasoning, <tool_call>.
+- Be brief: one sentence for Reasoning.
 - Do not output anything else outside those parts.
 - If finishing, use action=terminate in the tool call."""
 
@@ -229,10 +229,11 @@ class BranchGeneratedQwenCollator:
         - current_step_idx: index into `all_steps` for the current step
     """
 
-    def __init__(self, args, processor, max_steps=1):
+    def __init__(self, args, processor, max_steps=1, dual_training_types=True):
         self.max_steps = max_steps
         self.processor = processor
         self.args = args
+        self.dual_training_types = dual_training_types  # Enable both training types
         # Counter to control how often we print input/output for debugging
         self._call_count = 0
 
@@ -533,8 +534,8 @@ class BranchGeneratedQwenCollator:
                         if i < len(all_steps):
                             prev_step_i = all_steps[i]
                             prev_desc_i = (
-                                prev_step_i.get("action_proposal")
-                                or prev_step_i.get("reasoning", "")
+                                prev_step_i.get("reasoning", "")
+                                or prev_step_i.get("action_proposal")
                             )
                             prev_actions_for_this_step.append(
                                 f"Step {i+1}: {prev_desc_i}"
@@ -573,17 +574,17 @@ Previous actions:
 
                 # Assistant response: Action: + <tool_call> format
                 # Prefer action_proposal (short imperative) over full reasoning text
-                reasoning = prev_step.get("action_proposal") or prev_step.get(
-                    "reasoning", ""
+                reasoning = prev_step.get("reasoning", "") or prev_step.get(
+                    "action_proposal", ""
                 )
                 tool_call_json = self._build_tool_call_from_action_dict(prev_step)
                 
                 if tool_call_json:
-                    action_line = f"Action: {reasoning}" if reasoning else "Action: Perform action"
+                    action_line = f"Reasoning: {reasoning}" if reasoning else "Reasoning: Perform action"
                     tool_call_text = f"<tool_call>\n{json.dumps(tool_call_json, ensure_ascii=False)}\n</tool_call>"
                     assistant_text = f"{action_line}\n{tool_call_text}"
                 else:
-                    assistant_text = f"Action: {reasoning}" if reasoning else "Action: Continue"
+                    assistant_text = f"Reasoning: {reasoning}" if reasoning else "Reasoning: Continue"
                 
                 messages.append(
                     {
@@ -614,8 +615,8 @@ Previous actions:
                 if i < len(all_steps):
                     prev_step_i = all_steps[i]
                     prev_desc_i = (
-                        prev_step_i.get("action_proposal")
-                        or prev_step_i.get("reasoning", "")
+                        prev_step_i.get("reasoning", "")
+                        or prev_step_i.get("action_proposal", "")
                     )
                     previous_actions.append(f"Step {i+1}: {prev_desc_i}")
         previous_actions_str = "\n".join(previous_actions) if previous_actions else "None"
@@ -655,6 +656,21 @@ Previous actions:
                 }
             )
 
+        # Get training type from the example (set during dataset creation)
+        # Type 1: predict action_proposal + action
+        # Type 2: given action_proposal, predict action only
+        training_type = example.get("training_type", "type1")
+        use_type_2 = (training_type == "type2")
+        
+        # For Type 2, add action_proposal to the input prompt
+        if use_type_2:
+            action_text = step.get("reasoning", "") or step.get("action_proposal", "")
+            if action_text:
+                # Add action_proposal as part of the user's query
+                action_proposal_prompt = f"\nReasoning: {action_text}\n"
+                # Add to the last user message
+                messages[-1]["content"].append({"type": "text", "text": action_proposal_prompt})
+        
         prompt = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
@@ -668,32 +684,36 @@ Previous actions:
         labels = [torch.tensor([-100] * len(batch["input_ids"][0])).unsqueeze(0)]
         image_grid_thw = batch["image_grid_thw"]
 
-        # Supervised target: model should output both action description and action_dict.
-        # Prefer `action_proposal` (short imperative) over `reasoning` (longer CoT).
-        action_text = step.get("action_proposal") or step.get("reasoning", "")
+        # Build supervised target based on training type
+        action_text = step.get("reasoning", "") or step.get("action_proposal", "")
         tool_call = self._build_tool_call_from_action_dict(step)
 
-        # Build the textual target in the exact format expected by Qwen3VLAgent:
-        #   Action: ...
-        #   <tool_call>
-        #   {"name": "computer_use", "arguments": {...}}
-        #   </tool_call>
+        # Build the textual target
         lines = []
-        if action_text:
-            lines.append(f"Action: {action_text}")
-        else:
-            # Fallback description if we have no explicit reasoning.
+        
+        if use_type_2:
+            # Type 2: Only output the tool_call (action_proposal was given in input)
             if tool_call and isinstance(tool_call, dict):
-                args = tool_call.get("arguments", {}) or {}
-                act = args.get("action", "unknown")
-                lines.append(f"Action: Perform {act} action")
+                lines.append("<tool_call>")
+                lines.append(json.dumps(tool_call, ensure_ascii=False))
+                lines.append("</tool_call>")
+        else:
+            # Type 1: Output both action_proposal and tool_call
+            if action_text:
+                lines.append(f"Reasoning: {action_text}")
             else:
-                lines.append("Action: Decide the next action based on the screenshot.")
+                # Fallback description if we have no explicit reasoning.
+                if tool_call and isinstance(tool_call, dict):
+                    args = tool_call.get("arguments", {}) or {}
+                    act = args.get("action", "unknown")
+                    lines.append(f"Reasoning: Perform {act} action")
+                else:
+                    lines.append("Reasoning: Decide the next action based on the screenshot.")
 
-        if tool_call and isinstance(tool_call, dict):
-            lines.append("<tool_call>")
-            lines.append(json.dumps(tool_call, ensure_ascii=False))
-            lines.append("</tool_call>")
+            if tool_call and isinstance(tool_call, dict):
+                lines.append("<tool_call>")
+                lines.append(json.dumps(tool_call, ensure_ascii=False))
+                lines.append("</tool_call>")
 
         answer = "\n".join(lines) + "<|im_end|>\n<|endoftext|>"
 
@@ -734,23 +754,69 @@ Previous actions:
         # ------------------------------------------------------------------
         if self._call_count <= 5 or self._call_count % 100 == 0:
             try:
-                max_chars = 10000
-                print("\n" + "=" * 80)
-                print(f"[Collator Debug] Batch #{self._call_count}")
-                print("-" * 80)
-                print("[Model INPUT prompt] (truncated)")
-                print(prompt[:max_chars])
-                if len(prompt) > max_chars:
-                    print("...[truncated]...")
-                print("-" * 80)
-                print("[Model TARGET answer] (truncated)")
-                print(answer[:max_chars])
-                if len(answer) > max_chars:
-                    print("...[truncated]...")
-                print("=" * 80 + "\n")
+                training_type = "Type 2 (with action_proposal)" if use_type_2 else "Type 1 (predict action_proposal + action)"
+                
+                # Extract key information
+                step_id = step.get("step", "?")
+                is_replay = step.get("is_replay", False)
+                step_type = "Replay" if is_replay else "Regular"
+                num_images_used = len(images)
+                
+                print("\n" + "╔" + "=" * 98 + "╗")
+                print(f"║  TRAINING EXAMPLE #{self._call_count:04d} - {training_type:^60s}  ║")
+                print("╠" + "=" * 98 + "╣")
+                print(f"║  Step: {step_id} ({step_type}) | Images: {num_images_used} | Task: {overall_task[:45]:45s}  ║")
+                print("╠" + "=" * 98 + "╣")
+                
+                # Show the messages structure more clearly
+                print("║  MESSAGE STRUCTURE:")
+                for i, msg in enumerate(messages):
+                    role = msg["role"]
+                    content_items = msg["content"]
+                    content_types = [item["type"] for item in content_items]
+                    print(f"║    [{i}] {role:10s}: {', '.join(content_types)}")
+                print("╠" + "=" * 98 + "╣")
+                
+                # Show the full prompt (input to model)
+                print("║  MODEL INPUT PROMPT:")
+                print("╠" + "-" * 98 + "╣")
+                prompt_lines = prompt.split('\n')
+                for line in prompt_lines[:100]:  # Show first 100 lines
+                    # Truncate very long lines
+                    if len(line) > 96:
+                        print(f"║  {line[:93]}...")
+                    else:
+                        print(f"║  {line:96s}║")
+                if len(prompt_lines) > 100:
+                    print(f"║  ... [{len(prompt_lines) - 100} more lines omitted] ...")
+                
+                print("╠" + "=" * 98 + "╣")
+                
+                # Show the target answer (what model should output)
+                print("║  MODEL TARGET OUTPUT:")
+                print("╠" + "-" * 98 + "╣")
+                answer_lines = answer.split('\n')
+                for line in answer_lines:
+                    # Truncate very long lines
+                    if len(line) > 96:
+                        print(f"║  {line[:93]}...")
+                    else:
+                        print(f"║  {line:96s}║")
+                
+                print("╠" + "=" * 98 + "╣")
+                
+                # Show token statistics
+                num_input_tokens = input_ids.shape[1]
+                num_label_tokens = (labels[0] != -100).sum().item()
+                print(f"║  TOKENS: Input={num_input_tokens:5d} | Labels={num_label_tokens:5d} | Images={num_images_used:2d}" + " " * 38 + "║")
+                
+                print("╚" + "=" * 98 + "╝\n")
+                
             except Exception as e:
                 # Never break training because of debug printing
                 print(f"[Collator Debug] Failed to print input/output: {e}")
+                import traceback
+                traceback.print_exc()
 
         return batch
 
@@ -860,7 +926,7 @@ def main():
         "--num_train_epochs", type=int, default=1, help="Number of training epochs"
     )
     parser.add_argument(
-        "--learning_rate", type=float, default=5e-6, help="Learning rate"
+        "--learning_rate", type=float, default=1e-5, help="Learning rate"
     )
     parser.add_argument("--wd", type=float, default=0.01, help="Weight decay")
     parser.add_argument(
@@ -899,6 +965,24 @@ def main():
             "Set to 0 to only use the current screenshot."
         ),
     )
+    parser.add_argument(
+        "--dual_training_types",
+        action="store_true",
+        default=True,
+        help=(
+            "Enable dual training types: "
+            "Type 1: instruction + history → predict (action_proposal + action), "
+            "Type 2: instruction + history + action_proposal → predict action only. "
+            "When enabled, creates BOTH training examples for each step (doubles the dataset size). "
+            "Default is True."
+        ),
+    )
+    parser.add_argument(
+        "--no_dual_training_types",
+        dest="dual_training_types",
+        action="store_false",
+        help="Disable dual training types and only use Type 1 (original behavior)."
+    )
 
     args = parser.parse_args()
 
@@ -928,10 +1012,18 @@ def main():
         raise ValueError(
             "You must provide --branch_generated_root pointing to the branch_generated directory."
         )
-    train_dataset = create_branch_generated_dataset(args.branch_generated_root)
+    train_dataset = create_branch_generated_dataset(
+        args.branch_generated_root,
+        dual_training_types=args.dual_training_types
+    )
+
+    # Shuffle the dataset to ensure Type 1 and Type 2 examples of the same step
+    # are not adjacent. This prevents the model from memorizing consecutive patterns.
+    train_dataset = train_dataset.shuffle(seed=42)
 
     print("train_dataset:", train_dataset)
     print("len(train_dataset):", len(train_dataset))
+    print("Dataset shuffled to randomize Type 1 and Type 2 examples.")
 
     import time
 
@@ -966,7 +1058,7 @@ def main():
         weight_decay=args.wd,
         max_grad_norm=1.0,
         lr_scheduler_type="linear",
-        warmup_steps=10,
+        warmup_steps=20,
         logging_steps=10,
         output_dir=args.output_dir,
         save_strategy=args.save_strategy,
@@ -984,7 +1076,9 @@ def main():
         dataloader_prefetch_factor=1,  # 2,
     )
 
-    data_collator = BranchGeneratedQwenCollator(args, processor)
+    data_collator = BranchGeneratedQwenCollator(
+        args, processor, dual_training_types=args.dual_training_types
+    )
 
     # Save a "checkpoint-0" copy of the original (pre-finetune) model & processor
     out_path = Path(training_args.output_dir)

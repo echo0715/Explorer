@@ -8,9 +8,9 @@ import torch
 from accelerate import Accelerator
 from transformers import (
     AutoProcessor,
-    AutoModelForVision2Seq,
     Trainer,
     TrainingArguments,
+    MllamaForConditionalGeneration,
 )
 
 from PIL import Image
@@ -37,7 +37,7 @@ DS_CONFIG_DICT = {
         "offload_param": {
             "device": "cpu",
             "pin_memory": True,
-        },
+        }
     },
     "fp16": {
         "enabled": "auto",
@@ -54,30 +54,30 @@ DS_CONFIG_DICT = {
     "gradient_clipping": "auto",
 }
 
-
-def create_model(model_name_or_path, use_flash_attention: bool = False, cache_dir=None):
+def create_model(model_name_or_path, use_flash_attention=False, cache_dir=None):
     """
-    Create a LLaMA-based vision-language model for conditional generation.
-
-    We use AutoModelForVision2Seq so this script can work with any compatible
-    LLaMA-V / LLaVA-style model that exposes a vision+language interface.
+    Create a LLaMA Vision model for training.
+    
+    Args:
+        model_name_or_path: Path to the pretrained model or HuggingFace model ID
+            (e.g., meta-llama/Llama-3.2-11B-Vision-Instruct)
+        use_flash_attention: Whether to use Flash Attention 2
+        cache_dir: Directory to cache downloaded models
     """
-    # NOTE: most LLaMA-V / LLaVA checkpoints do not yet expose a unified
-    # `attn_implementation` flag the way Qwen3 does, so we ignore
-    # `use_flash_attention` here and rely on the model's defaults.
-    model = AutoModelForVision2Seq.from_pretrained(
+    
+    model = MllamaForConditionalGeneration.from_pretrained(
         model_name_or_path,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         cache_dir=cache_dir,
+        attn_implementation="flash_attention_2" if use_flash_attention else None,
     )
+
     return model
 
 
 def build_system_prompt(coordinate_type="relative", processed_width=1000, processed_height=1000):
     """
-    Build the system prompt for tool-call-style GUI control, matching the
-    format used by the Qwen-based agent so that datasets and policies are
-    interchangeable.
+    Build the system prompt exactly as qwen3vl_agent.py does, including the tools_def JSON.
     """
     description_prompt_lines = [
         "Use a mouse and keyboard to interact with a computer, and take screenshots.",
@@ -112,53 +112,36 @@ def build_system_prompt(coordinate_type="relative", processed_width=1000, proces
         """
 
     tools_def = {
-        "type": "function",
+        "type": "function", 
         "function": {
-            "name_for_human": "computer_use",
-            "name": "computer_use",
+            "name_for_human": "computer_use", 
+            "name": "computer_use", 
             "description": description_prompt,
             "parameters": {
                 "properties": {
                     "action": {
                         "description": action_description_prompt,
-                        "enum": [
-                            "key",
-                            "type",
-                            "mouse_move",
-                            "left_click",
-                            "left_click_drag",
-                            "right_click",
-                            "middle_click",
-                            "double_click",
-                            "scroll",
-                            "wait",
-                            "terminate",
-                        ],
-                        "type": "string",
+                        "enum": ["key", "type", "mouse_move", "left_click", "left_click_drag", 
+                                 "right_click", "middle_click", "double_click", "scroll", "wait", "terminate"], 
+                        "type": "string"
                     },
-                    "keys": {"description": "Required only by `action=key`.", "type": "array"},
-                    "text": {"description": "Required only by `action=type`.", "type": "string"},
-                    "coordinate": {
-                        "description": "The x,y target coordinates for mouse actions.",
-                        "type": "array",
-                    },
-                    "start_coordinate": {
-                        "description": "The x,y starting coordinates for drag actions.",
-                        "type": "array",
-                    },
-                    "pixels": {"description": "The amount of scrolling.", "type": "number"},
-                    "time": {"description": "The seconds to wait.", "type": "number"},
+                    "keys": {"description": "Required only by `action=key`.", "type": "array"}, 
+                    "text": {"description": "Required only by `action=type`.", "type": "string"}, 
+                    "coordinate": {"description": "The x,y target coordinates for mouse actions.", "type": "array"}, 
+                    "start_coordinate": {"description": "The x,y starting coordinates for drag actions.", "type": "array"},
+                    "pixels": {"description": "The amount of scrolling.", "type": "number"}, 
+                    "time": {"description": "The seconds to wait.", "type": "number"}, 
                     "status": {
-                        "description": "The status of the task.",
-                        "type": "string",
-                        "enum": ["success", "failure"],
-                    },
-                },
-                "required": ["action"],
-                "type": "object",
-            },
-            "args_format": "Format the arguments as a JSON object.",
-        },
+                        "description": "The status of the task.", 
+                        "type": "string", 
+                        "enum": ["success", "failure"]
+                    }
+                }, 
+                "required": ["action"], 
+                "type": "object"
+            }, 
+            "args_format": "Format the arguments as a JSON object."
+        }
     }
 
     system_prompt = """# Tools
@@ -178,12 +161,12 @@ For each function call, return a json object with function name and arguments wi
 # Response format
 
 Response format for every step:
-1) Action: a short imperative describing what to do in the UI.
+1) Reasoning: a short reasoning describe the thinking and the action to take in the UI.
 2) A single <tool_call>...</tool_call> block containing only the JSON: {"name": <function-name>, "arguments": <args-json-object>}.
 
 Rules:
-- Output exactly in the order: Action, <tool_call>.
-- Be brief: one sentence for Action.
+- Output exactly in the order: Reasoning, <tool_call>.
+- Be brief: one sentence for Reasoning.
 - Do not output anything else outside those parts.
 - If finishing, use action=terminate in the tool call."""
 
@@ -192,11 +175,8 @@ Rules:
 
 class BranchGeneratedLlamaCollator:
     """
-    Data collator for training directly on branch-generated trajectories, one
-    target step per example, using multi-step, multi-image chat histories.
-
-    This mirrors the Qwen collator but is architecturally model-agnostic so
-    it can be used with LLaMA-based vision-language models.
+    Data collator for training LLaMA Vision models on branch-generated 
+    trajectories, one target step per example, using multi-step, multi-image chat histories.
 
     Expects each dataset example to have the following fields (as created by
     `create_branch_generated_dataset`):
@@ -213,17 +193,18 @@ class BranchGeneratedLlamaCollator:
         - current_step_idx: index into `all_steps` for the current step
     """
 
-    def __init__(self, args, processor, max_steps=1):
+    def __init__(self, args, processor, max_steps=1, dual_training_types=True):
         self.max_steps = max_steps
         self.processor = processor
         self.args = args
+        self.dual_training_types = dual_training_types  # Enable both training types
         # Counter to control how often we print input/output for debugging
         self._call_count = 0
 
     def _build_tool_call_from_action_dict(self, step):
         """
         Convert a high-level action_dict from the dataset into a tool-call JSON
-        compatible with the agent's parse_response, of the form:
+        compatible with LLaMA agent format, of the form:
             {"name": "computer_use", "arguments": {...}}
 
         Note: Training data coordinates are in 1280x720 pixel space. At runtime,
@@ -256,8 +237,7 @@ class BranchGeneratedLlamaCollator:
         if not raw_action_type:
             return None
 
-        # Map triple_click → double_click for execution environments that only
-        # support double_click.
+        # Map triple_click → double_click since agent uses double_click
         if raw_action_type == "triple_click":
             action_type = "double_click"
         else:
@@ -266,15 +246,19 @@ class BranchGeneratedLlamaCollator:
         arguments = {"action": action_type}
 
         # Helper function to scale coordinates from 1280x720 absolute pixels
-        # into a 0..999 relative integer grid.
+        # into a 0..999 relative integer grid, matching the agent when
+        # coordinate_type == "relative".
         def scale_coordinate_to_relative(coord):
             """
             Scale coordinate from 1280x720 pixel space into 0..999 relative
             integer space.
 
-            For relative coordinates the agent typically assumes:
+            The agent's parse_response() assumes that for relative coordinates:
                 x_screen = x_rel * (original_width / 999)
                 y_screen = y_rel * (original_height / 999)
+            So here we normalize the recorded 1280x720 coordinates into that
+            0..999 range and then round to integers before returning, so the
+            model always sees integer coordinates.
             """
             if isinstance(coord, (list, tuple)) and len(coord) == 2:
                 base_w, base_h = 1280.0, 720.0
@@ -312,8 +296,9 @@ class BranchGeneratedLlamaCollator:
             "mouse_move",
             "left_click_drag",
         ):
-            # For drag actions, preserve both the start and end coordinates so
-            # the model learns to move to the start and then drag to the end.
+            # For drag actions, we want to preserve both the start and end
+            # coordinates so the model learns to move to the start and then
+            # drag to the end, matching the pyautogui sequence in the data.
             if action_type == "left_click_drag":
                 start_coord = input_dict.get("start_coordinate")
                 end_coord = input_dict.get("coordinate")
@@ -326,7 +311,7 @@ class BranchGeneratedLlamaCollator:
                 if isinstance(end_coord, (list, tuple)) and len(end_coord) == 2:
                     arguments["coordinate"] = scale_coordinate_to_relative(end_coord)
                 else:
-                    print("No end coordinate provided for left_click_drag")
+                    print("No end coordinate provided!!!!!!!!!")
             else:
                 coord = input_dict.get("coordinate")
                 if coord is None:
@@ -335,7 +320,8 @@ class BranchGeneratedLlamaCollator:
                     coord = input_dict.get("start_coordinate")
                 if isinstance(coord, (list, tuple)) and len(coord) == 2:
                     # Scale from 1280x720 absolute pixels into 0..999 relative
-                    # coordinates so that training matches the runtime agent.
+                    # coordinates so that training matches agent with
+                    # coordinate_type="relative".
                     arguments["coordinate"] = scale_coordinate_to_relative(coord)
 
             if action_type == "left_click_drag":
@@ -405,17 +391,16 @@ class BranchGeneratedLlamaCollator:
         overall_task = example["task_description"]
         # Text-only history from the dataset (kept for backward compatibility).
         text_history = example.get("history", "")
-        _ = text_history  # currently unused but kept for compatibility
 
         all_steps = example.get("all_steps", None)
         current_step_idx = example.get("current_step_idx", None)
 
-        # Build system prompt used for training
+        # Build system prompt exactly as the agent does
         # Training uses 1920x1080 images, coordinate_type defaults to "relative"
         system_prompt_text = build_system_prompt(
             coordinate_type="relative",
             processed_width=1920,
-            processed_height=1080,
+            processed_height=1080
         )
 
         system_message = {
@@ -433,7 +418,7 @@ class BranchGeneratedLlamaCollator:
         def load_step_image(step_entry):
             step_id_local = step_entry.get("step")
             is_replay_local = step_entry.get("is_replay", False)
-
+            
             # For predicting an action, we need the screenshot from the previous step
             if is_replay_local:
                 # For replay step N, we need the screenshot from replay step N-1
@@ -464,7 +449,7 @@ class BranchGeneratedLlamaCollator:
                     else:
                         # Fallback: if no replay steps exist, use step_0_replay.png
                         img_path = os.path.join(
-                            branch_dir, "screenshots", "step_0_replay.png"
+                            branch_dir, "screenshots", f"step_0_replay.png"
                         )
                 else:
                     img_path = os.path.join(
@@ -472,8 +457,7 @@ class BranchGeneratedLlamaCollator:
                     )
 
             image_local = Image.open(img_path)
-            # Use original 1920x1080 resolution without resizing; the processor
-            # will handle any necessary resizing.
+            # Use original 1920x1080 resolution without resizing
             return image_local, img_path
 
         messages = [system_message]
@@ -514,18 +498,16 @@ class BranchGeneratedLlamaCollator:
                         if i < len(all_steps):
                             prev_step_i = all_steps[i]
                             prev_desc_i = (
-                                prev_step_i.get("action_proposal")
-                                or prev_step_i.get("reasoning", "")
+                                prev_step_i.get("reasoning", "")
+                                or prev_step_i.get("action_proposal")
                             )
                             prev_actions_for_this_step.append(
                                 f"Step {i+1}: {prev_desc_i}"
                             )
                     previous_actions_str = (
-                        "\n".join(prev_actions_for_this_step)
-                        if prev_actions_for_this_step
-                        else "None"
+                        "\n".join(prev_actions_for_this_step) if prev_actions_for_this_step else "None"
                     )
-
+                    
                     instruction_prompt = f"""
 Please generate the next move according to the UI screenshot, instruction and previous actions.
 
@@ -533,7 +515,7 @@ Instruction: {overall_task}
 
 Previous actions:
 {previous_actions_str}"""
-
+                    
                     messages.append(
                         {
                             "role": "user",
@@ -548,28 +530,26 @@ Previous actions:
                     messages.append(
                         {
                             "role": "user",
-                            "content": [{"type": "image"}],
+                            "content": [
+                                {"type": "image"}
+                            ],
                         }
                     )
 
                 # Assistant response: Action: + <tool_call> format
                 # Prefer action_proposal (short imperative) over full reasoning text
-                reasoning = prev_step.get("action_proposal") or prev_step.get(
-                    "reasoning", ""
+                reasoning = prev_step.get("reasoning", "") or prev_step.get(
+                    "action_proposal", ""
                 )
                 tool_call_json = self._build_tool_call_from_action_dict(prev_step)
-
+                
                 if tool_call_json:
-                    action_line = f"Action: {reasoning}" if reasoning else "Action: Perform action"
-                    tool_call_text = (
-                        "<tool_call>\n"
-                        + json.dumps(tool_call_json, ensure_ascii=False)
-                        + "\n</tool_call>"
-                    )
+                    action_line = f"Reasoning: {reasoning}" if reasoning else "Reasoning: Perform action"
+                    tool_call_text = f"<tool_call>\n{json.dumps(tool_call_json, ensure_ascii=False)}\n</tool_call>"
                     assistant_text = f"{action_line}\n{tool_call_text}"
                 else:
-                    assistant_text = f"Action: {reasoning}" if reasoning else "Action: Continue"
-
+                    assistant_text = f"Reasoning: {reasoning}" if reasoning else "Reasoning: Continue"
+                
                 messages.append(
                     {
                         "role": "assistant",
@@ -599,13 +579,13 @@ Previous actions:
                 if i < len(all_steps):
                     prev_step_i = all_steps[i]
                     prev_desc_i = (
-                        prev_step_i.get("action_proposal")
-                        or prev_step_i.get("reasoning", "")
+                        prev_step_i.get("reasoning", "")
+                        or prev_step_i.get("action_proposal", "")
                     )
                     previous_actions.append(f"Step {i+1}: {prev_desc_i}")
         previous_actions_str = "\n".join(previous_actions) if previous_actions else "None"
 
-        # Build instruction_prompt for the current step
+        # Build instruction_prompt
         instruction_prompt = f"""
 Please generate the next move according to the UI screenshot, instruction and previous actions.
 
@@ -614,7 +594,7 @@ Instruction: {overall_task}
 Previous actions:
 {previous_actions_str}"""
 
-        # Final user turn:
+        # Final user turn
         # If this is the first message (no history), include both image and text
         # If we have history, just add the current image (text was in first history message)
         if use_full_history and current_step_idx > 0:
@@ -623,7 +603,9 @@ Previous actions:
             messages.append(
                 {
                     "role": "user",
-                    "content": [{"type": "image"}],
+                    "content": [
+                        {"type": "image"}
+                    ],
                 }
             )
         else:
@@ -638,49 +620,72 @@ Previous actions:
                 }
             )
 
+        # Get training type from the example (set during dataset creation)
+        # Type 1: predict action_proposal + action
+        # Type 2: given action_proposal, predict action only
+        training_type = example.get("training_type", "type1")
+        use_type_2 = (training_type == "type2")
+        
+        # For Type 2, add action_proposal to the input prompt
+        if use_type_2:
+            action_text = step.get("reasoning", "") or step.get("action_proposal", "")
+            if action_text:
+                # Add action_proposal as part of the user's query
+                action_proposal_prompt = f"\nReasoning: {action_text}\n"
+                # Add to the last user message
+                messages[-1]["content"].append({"type": "text", "text": action_proposal_prompt})
+        
         prompt = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
 
+
         batch = self.processor(
-            text=[prompt],
-            images=[images],
-            padding=True,
-            return_tensors="pt",
+            text=[prompt], images=[images], padding=True, return_tensors="pt"
         )
 
         input_ids = [batch["input_ids"]]
         labels = [torch.tensor([-100] * len(batch["input_ids"][0])).unsqueeze(0)]
-        image_grid_thw = batch.get("image_grid_thw", None)
+        
+        # LLaMA uses different keys for image features
+        # Check what keys are available
+        aspect_ratio_ids = batch.get("aspect_ratio_ids", None)
+        aspect_ratio_mask = batch.get("aspect_ratio_mask", None)
+        cross_attention_mask = batch.get("cross_attention_mask", None)
 
-        # Supervised target: model should output both action description and action_dict.
-        # Prefer `action_proposal` (short imperative) over `reasoning` (longer CoT).
-        reasoning = step.get("action_proposal") or step.get("reasoning", "")
+        # Build supervised target based on training type
+        action_text = step.get("reasoning", "") or step.get("action_proposal", "")
         tool_call = self._build_tool_call_from_action_dict(step)
 
-        # Build the textual target in the exact format expected by the agent:
-        #   Action: ...
-        #   <tool_call>
-        #   {"name": "computer_use", "arguments": {...}}
-        #   </tool_call>
+        # Build the textual target
         lines = []
-        if reasoning:
-            lines.append(f"Action: {reasoning}")
-        else:
-            # Fallback description if we have no explicit reasoning.
+        
+        if use_type_2:
+            # Type 2: Only output the tool_call (action_proposal was given in input)
             if tool_call and isinstance(tool_call, dict):
-                args = tool_call.get("arguments", {}) or {}
-                act = args.get("action", "unknown")
-                lines.append(f"Action: Perform {act} action")
+                lines.append("<tool_call>")
+                lines.append(json.dumps(tool_call, ensure_ascii=False))
+                lines.append("</tool_call>")
+        else:
+            # Type 1: Output both action_proposal and tool_call
+            if action_text:
+                lines.append(f"Reasoning: {action_text}")
             else:
-                lines.append("Action: Decide the next action based on the screenshot.")
+                # Fallback description if we have no explicit reasoning.
+                if tool_call and isinstance(tool_call, dict):
+                    args = tool_call.get("arguments", {}) or {}
+                    act = args.get("action", "unknown")
+                    lines.append(f"Reasoning: Perform {act} action")
+                else:
+                    lines.append("Reasoning: Decide the next action based on the screenshot.")
 
-        if tool_call and isinstance(tool_call, dict):
-            lines.append("<tool_call>")
-            lines.append(json.dumps(tool_call, ensure_ascii=False))
-            lines.append("</tool_call>")
+            if tool_call and isinstance(tool_call, dict):
+                lines.append("<tool_call>")
+                lines.append(json.dumps(tool_call, ensure_ascii=False))
+                lines.append("</tool_call>")
 
-        answer = "\n".join(lines) + "<|im_end|>\n<|endoftext|>"
+        # LLaMA uses different EOS tokens
+        answer = "\n".join(lines) + "<|eot_id|>"
 
         answer_input_ids = self.processor.tokenizer(
             answer, add_special_tokens=False, return_tensors="pt"
@@ -696,14 +701,20 @@ Previous actions:
 
         attention_mask = torch.ones_like(input_ids)
 
-        batch = {
+        batch_out = {
             "input_ids": input_ids,
             "labels": labels,
             "pixel_values": pixel_values,
             "attention_mask": attention_mask,
         }
-        if image_grid_thw is not None:
-            batch["image_grid_thw"] = image_grid_thw
+        
+        # Add LLaMA-specific fields if they exist
+        if aspect_ratio_ids is not None:
+            batch_out["aspect_ratio_ids"] = aspect_ratio_ids
+        if aspect_ratio_mask is not None:
+            batch_out["aspect_ratio_mask"] = aspect_ratio_mask
+        if cross_attention_mask is not None:
+            batch_out["cross_attention_mask"] = cross_attention_mask
 
         # ------------------------------------------------------------------
         # Debug: print model input (prompt) and target output (answer).
@@ -713,59 +724,96 @@ Previous actions:
         # ------------------------------------------------------------------
         if self._call_count <= 5 or self._call_count % 100 == 0:
             try:
-                max_chars = 10000
-                print("\n" + "=" * 80)
-                print(f"[LLaMA Collator Debug] Batch #{self._call_count}")
-                print("-" * 80)
-                print("[Model INPUT prompt] (truncated)")
-                print(prompt[:max_chars])
-                if len(prompt) > max_chars:
-                    print("...[truncated]...")
-                print("-" * 80)
-                print("[Model TARGET answer] (truncated)")
-                print(answer[:max_chars])
-                if len(answer) > max_chars:
-                    print("...[truncated]...")
-                print("=" * 80 + "\n")
+                training_type_str = "Type 2 (with action_proposal)" if use_type_2 else "Type 1 (predict action_proposal + action)"
+                
+                # Extract key information
+                step_id = step.get("step", "?")
+                is_replay = step.get("is_replay", False)
+                step_type = "Replay" if is_replay else "Regular"
+                num_images_used = len(images)
+                
+                print("\n" + "╔" + "=" * 98 + "╗")
+                print(f"║  TRAINING EXAMPLE #{self._call_count:04d} - {training_type_str:^60s}  ║")
+                print("╠" + "=" * 98 + "╣")
+                print(f"║  Step: {step_id} ({step_type}) | Images: {num_images_used} | Task: {overall_task[:45]:45s}  ║")
+                print("╠" + "=" * 98 + "╣")
+                
+                # Show the messages structure more clearly
+                print("║  MESSAGE STRUCTURE:")
+                for i, msg in enumerate(messages):
+                    role = msg["role"]
+                    content_items = msg["content"]
+                    content_types = [item["type"] for item in content_items]
+                    print(f"║    [{i}] {role:10s}: {', '.join(content_types)}")
+                print("╠" + "=" * 98 + "╣")
+                
+                # Show the full prompt (input to model)
+                print("║  MODEL INPUT PROMPT:")
+                print("╠" + "-" * 98 + "╣")
+                prompt_lines = prompt.split('\n')
+                for line in prompt_lines[:100]:  # Show first 100 lines
+                    # Truncate very long lines
+                    if len(line) > 96:
+                        print(f"║  {line[:93]}...")
+                    else:
+                        print(f"║  {line:96s}║")
+                if len(prompt_lines) > 100:
+                    print(f"║  ... [{len(prompt_lines) - 100} more lines omitted] ...")
+                
+                print("╠" + "=" * 98 + "╣")
+                
+                # Show the target answer (what model should output)
+                print("║  MODEL TARGET OUTPUT:")
+                print("╠" + "-" * 98 + "╣")
+                answer_lines = answer.split('\n')
+                for line in answer_lines:
+                    # Truncate very long lines
+                    if len(line) > 96:
+                        print(f"║  {line[:93]}...")
+                    else:
+                        print(f"║  {line:96s}║")
+                
+                print("╠" + "=" * 98 + "╣")
+                
+                # Show token statistics
+                num_input_tokens = input_ids.shape[1]
+                num_label_tokens = (labels[0] != -100).sum().item()
+                print(f"║  TOKENS: Input={num_input_tokens:5d} | Labels={num_label_tokens:5d} | Images={num_images_used:2d}" + " " * 38 + "║")
+                
+                print("╚" + "=" * 98 + "╝\n")
+                
             except Exception as e:
                 # Never break training because of debug printing
-                print(f"[LLaMA Collator Debug] Failed to print input/output: {e}")
+                print(f"[Collator Debug] Failed to print input/output: {e}")
+                import traceback
+                traceback.print_exc()
 
-        return batch
+        return batch_out
 
 
 class SafeTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.step_token_counts = []  # Track tokens per GPU for current step
-
+    
     def training_step(self, model, inputs, num_items_in_batch=None):
         try:
             # Print token usage for this training step
             if "input_ids" in inputs:
                 num_input_tokens = inputs["input_ids"].shape[1]
                 num_labels = (inputs["labels"] != -100).sum().item()
-                num_images = (
-                    inputs.get("image_grid_thw", torch.tensor([])).shape[0]
-                    if "image_grid_thw" in inputs
-                    else 0
-                )
-
+                num_images = inputs.get("pixel_values", torch.tensor([])).shape[0] if "pixel_values" in inputs else 0
+                
                 # Track for aggregation across gradient accumulation steps
                 self.step_token_counts.append(num_input_tokens)
-
-                # (Optional) memory usage logging omitted for brevity
-
+            
             # Run the standard training step
             return super().training_step(model, inputs, num_items_in_batch)
         except RuntimeError as e:
             if "out of memory" in str(e):
                 num_input_tokens = inputs["input_ids"].shape[1]
                 num_labels = (inputs["labels"] != -100).sum().item()
-                print(
-                    f"[OOM ERROR] Failed on {num_input_tokens} input tokens, {num_labels} label tokens. "
-                    f"Step token history: {self.step_token_counts}"
-                )
+                print(f"[OOM ERROR] Failed on {num_input_tokens} input tokens, {num_labels} label tokens. Step token history: {self.step_token_counts}")
                 self.step_token_counts = []  # Reset
                 # Clear the CUDA cache to recover memory
                 torch.cuda.empty_cache()
@@ -775,13 +823,22 @@ class SafeTrainer(Trainer):
 
 
 def main():
+    """
+    Train LLaMA Vision models on branch-generated trajectories.
+    
+    Example usage for LLaMA 3.2 11B Vision:
+        torchrun --nproc_per_node=4 train_llama.py \\
+            --model_name_or_path meta-llama/Llama-3.2-11B-Vision-Instruct \\
+            --use_flash_attention \\
+            --batch_size 16 \\
+            --output_dir /path/to/output
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        # You can change this to any compatible LLaMA-V / LLaVA-style checkpoint
         default="meta-llama/Llama-3.2-11B-Vision-Instruct",
-        help="Model name or path to load from",
+        help="Model name or path to load from (e.g., meta-llama/Llama-3.2-11B-Vision-Instruct or meta-llama/Llama-3.2-90B-Vision-Instruct)",
     )
     parser.add_argument(
         "--hf_cache_dir",
@@ -790,44 +847,28 @@ def main():
         help="Directory to use for Hugging Face cache (models, tokenizers, etc.)",
     )
     parser.add_argument(
-        "--use_flash_attention",
-        action="store_true",
-        help="(Unused for most LLaMA models) kept for CLI compatibility",
+        "--use_flash_attention", action="store_true", help="Use Flash Attention"
     )
-    parser.add_argument("--bf16", action="store_true", help="Use BF16")
+    parser.add_argument("--bf16", action="store_true", default=True, help="Use BF16 (default True for LLaMA)")
     parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="/gpfs/radev/home/jw3278/scratch/llama-vl-train",
-        help="Output directory",
+        "--output_dir", type=str, default="/gpfs/radev/home/jw3278/scratch/llama-vision-train", help="Output directory"
     )
     parser.add_argument(
-        "--save-strategy",
-        type=str,
-        default="steps",
-        help="Save strategy",
+        "--save-strategy", type=str, default="steps", help="Save strategy"
     )
-    parser.add_argument("--batch_size", type=int, default=15, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument(
-        "--num_train_epochs",
-        type=int,
-        default=1,
-        help="Number of training epochs",
+        "--num_train_epochs", type=int, default=1, help="Number of training epochs"
     )
     parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=4.0e-5,
-        help="Learning rate",
+        "--learning_rate", type=float, default=1e-5, help="Learning rate"
     )
     parser.add_argument("--wd", type=float, default=0.01, help="Weight decay")
     parser.add_argument(
         "--no-tqdm", dest="tqdm", action="store_false", help="Disable tqdm"
     )
     parser.add_argument(
-        "--tensorboard-logging",
-        action="store_true",
-        help="log to tensorboard",
+        "--tensorboard-logging", action="store_true", help="log to tensorboard"
     )
     parser.add_argument(
         "--use-google-search",
@@ -855,8 +896,27 @@ def main():
         default=2,
         help=(
             "Maximum number of past screenshots (steps) to include in the prompt, "
-            "in addition to the current step. Set to 0 to only use the current screenshot."
+            "in addition to the current step. Default is 2. "
+            "Set to 0 to only use the current screenshot."
         ),
+    )
+    parser.add_argument(
+        "--dual_training_types",
+        action="store_true",
+        default=True,
+        help=(
+            "Enable dual training types: "
+            "Type 1: instruction + history → predict (action_proposal + action), "
+            "Type 2: instruction + history + action_proposal → predict action only. "
+            "When enabled, creates BOTH training examples for each step (doubles the dataset size). "
+            "Default is True."
+        ),
+    )
+    parser.add_argument(
+        "--no_dual_training_types",
+        dest="dual_training_types",
+        action="store_false",
+        help="Disable dual training types and only use Type 1 (original behavior)."
     )
 
     args = parser.parse_args()
@@ -886,10 +946,18 @@ def main():
         raise ValueError(
             "You must provide --branch_generated_root pointing to the branch_generated directory."
         )
-    train_dataset = create_branch_generated_dataset(args.branch_generated_root)
+    train_dataset = create_branch_generated_dataset(
+        args.branch_generated_root,
+        dual_training_types=args.dual_training_types
+    )
+
+    # Shuffle the dataset to ensure Type 1 and Type 2 examples of the same step
+    # are not adjacent. This prevents the model from memorizing consecutive patterns.
+    train_dataset = train_dataset.shuffle(seed=42)
 
     print("train_dataset:", train_dataset)
     print("len(train_dataset):", len(train_dataset))
+    print("Dataset shuffled to randomize Type 1 and Type 2 examples.")
 
     import time
 
@@ -910,7 +978,7 @@ def main():
 
     # hard coded training args
     training_args = TrainingArguments(
-        ddp_find_unused_parameters=True,
+        ddp_find_unused_parameters=False,  # Set to False for LLaMA (more efficient)
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=1,  # NOTE currently only supports batch_size == 1
         per_device_eval_batch_size=1,
@@ -924,7 +992,7 @@ def main():
         weight_decay=args.wd,
         max_grad_norm=1.0,
         lr_scheduler_type="linear",
-        warmup_steps=50,
+        warmup_steps=20,
         logging_steps=10,
         output_dir=args.output_dir,
         save_strategy=args.save_strategy,
@@ -941,11 +1009,20 @@ def main():
         dataloader_prefetch_factor=1,
     )
 
-    data_collator = BranchGeneratedLlamaCollator(args, processor)
+    data_collator = BranchGeneratedLlamaCollator(
+        args, processor, dual_training_types=args.dual_training_types
+    )
 
-    # eval before fine-tuning
+    # Save a "checkpoint-0" copy of the original (pre-finetune) model & processor
     out_path = Path(training_args.output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+    if accelerator.is_main_process:
+        pre_ft_ckpt_dir = out_path / "checkpoint-0"
+        pre_ft_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        # Save the base model and processor before any training updates
+        model.save_pretrained(pre_ft_ckpt_dir)
+        processor.save_pretrained(pre_ft_ckpt_dir)
+    accelerator.wait_for_everyone()
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     model = model.to(f"cuda:{local_rank}")
@@ -963,5 +1040,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

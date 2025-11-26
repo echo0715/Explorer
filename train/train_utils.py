@@ -9,9 +9,14 @@ import traceback
 import json
 
 
-def create_branch_generated_dataset(branch_root: str) -> Dataset:
+def create_branch_generated_dataset(branch_root: str, dual_training_types: bool = True) -> Dataset:
     """
     Create a HuggingFace Dataset from branch-generated trajectories.
+
+    Args:
+        branch_root: Root directory containing branch subdirectories
+        dual_training_types: If True, creates both Type 1 and Type 2 examples for each step,
+                           doubling the dataset size. If False, only creates Type 1 examples.
 
     Expected directory structure under `branch_root`:
         branch_root/
@@ -41,6 +46,7 @@ def create_branch_generated_dataset(branch_root: str) -> Dataset:
             - done: bool flag
         - all_steps: list of dicts for all steps in this branch (same schema as `step`)
         - current_step_idx: integer index into `all_steps` for the current step
+        - training_type: "type1" or "type2" indicating which training format to use
     """
     examples = []
 
@@ -206,6 +212,9 @@ def create_branch_generated_dataset(branch_root: str) -> Dataset:
                         "action_dict": action_dict,
                         "reward": record.get("reward", 0),
                         "done": record.get("done", False),
+                        # If skip is True, we still include this step in the trajectory
+                        # (for context/history), but don't create training examples from it
+                        "skip": record.get("skip", False),
                     }
                     steps.append(step_entry)
         except Exception as e:
@@ -237,30 +246,38 @@ def create_branch_generated_dataset(branch_root: str) -> Dataset:
                 step["action_proposal"] = "The task is completed successfully."
                 steps[idx] = step
 
-            # Skip training examples whose action_proposal is empty/missing.
-            # These steps can still appear in `all_steps` and contribute to
-            # history/context, but we do not create a supervised target for them.
-            action_proposal = step.get("action_proposal") or ""
-            if isinstance(action_proposal, str):
-                action_proposal = action_proposal.strip()
-            # Skip creating a supervised example for steps whose action_proposal
-            # is empty, EXCEPT for the final step in the trajectory. We keep the
-            # last step even if its action_proposal is empty so the model can
-            # still learn from terminal / DONE steps.
-            if action_proposal or is_last_step:
-                examples.append(
-                    {
-                        "task_description": task_description,
-                        "branch_dir": abs_branch_dir,
-                        "history": history_text,
-                        "step": step.copy(),
-                        # Provide full trajectory and index so the collator can
-                        # reconstruct multi-step, multi-image chat histories.
-                        "all_steps": steps,
-                        "current_step_idx": idx,
-                    }
-                )
+            # Skip creating training examples for steps marked with skip=True.
+            # These steps remain in the trajectory for context (history and screenshots),
+            # but we don't generate supervised targets from them.
+            should_skip = step.get("skip", False)
+            
+            if not should_skip:
+                # Create training examples for all non-skipped steps
+                base_example = {
+                    "task_description": task_description,
+                    "branch_dir": abs_branch_dir,
+                    "history": history_text,
+                    "step": step.copy(),
+                    # Provide full trajectory and index so the collator can
+                    # reconstruct multi-step, multi-image chat histories.
+                    "all_steps": steps,
+                    "current_step_idx": idx,
+                }
+                
+                # Create Type 1 example: predict action_proposal + action
+                example_type1 = base_example.copy()
+                example_type1["training_type"] = "type1"
+                examples.append(example_type1)
+                
+                # If dual_training_types is enabled, also create Type 2 example
+                if dual_training_types:
+                    # Create Type 2 example: given action_proposal, predict action only
+                    example_type2 = base_example.copy()
+                    example_type2["training_type"] = "type2"
+                    examples.append(example_type2)
 
+            # Always add reasoning to history (even for skipped steps)
+            # so that later steps have the full context
             r = step.get("reasoning", "")
             if r:
                 history_reasonings.append(r)
