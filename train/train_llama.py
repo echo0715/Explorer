@@ -701,6 +701,38 @@ Previous actions:
 
         attention_mask = torch.ones_like(input_ids)
 
+        # ------------------------------------------------------------------
+        # Ensure that the cross_attention_mask (if present) matches the
+        # final text sequence length after we append the supervised answer
+        # tokens. The processor builds masks for the original prompt-only
+        # sequence; here we pad or trim along the text dimension so that
+        # Mllama's cross-attention does not see a length mismatch.
+        # ------------------------------------------------------------------
+        if cross_attention_mask is not None:
+            try:
+                # Expected shape: [batch, 1, seq_len, image_seq_len]
+                old_seq_len = cross_attention_mask.shape[2]
+                new_seq_len = input_ids.shape[1]
+
+                if new_seq_len != old_seq_len:
+                    if new_seq_len < old_seq_len:
+                        # If for any reason the new sequence is shorter,
+                        # truncate the mask to the new length.
+                        cross_attention_mask = cross_attention_mask[:, :, :new_seq_len, :]
+                    else:
+                        # Pad by repeating the last timestep's mask so that
+                        # later tokens see the same image visibility pattern
+                        # as the final prompt token.
+                        pad_len = new_seq_len - old_seq_len
+                        last_step_mask = cross_attention_mask[:, :, -1:, :]  # [B, 1, 1, I]
+                        pad = last_step_mask.expand(-1, -1, pad_len, -1)     # [B, 1, pad_len, I]
+                        cross_attention_mask = torch.cat(
+                            [cross_attention_mask, pad], dim=2
+                        )
+            except Exception as e:
+                # Do not break training because of debug adjustment issues
+                print(f"[Collator Debug] Failed to adjust cross_attention_mask: {e}")
+
         batch_out = {
             "input_ids": input_ids,
             "labels": labels,
@@ -797,29 +829,57 @@ class SafeTrainer(Trainer):
         self.step_token_counts = []  # Track tokens per GPU for current step
     
     def training_step(self, model, inputs, num_items_in_batch=None):
+        """
+        Override training_step to handle OOM errors in a distributed-safe manner.
+        
+        With DeepSpeed ZeRO-3, all ranks must execute the same forward pass because
+        parameters are partitioned. If one rank hits OOM and returns early while
+        others continue, DeepSpeed will detect a rank disagreement and crash.
+        
+        Solution: Use torch.distributed to synchronize OOM status across all ranks.
+        If ANY rank hits OOM, ALL ranks skip the step together.
+        """
+        import torch.distributed as dist
+        
+        # Track token usage
+        if "input_ids" in inputs:
+            num_input_tokens = inputs["input_ids"].shape[1]
+            num_labels = (inputs["labels"] != -100).sum().item()
+            self.step_token_counts.append(num_input_tokens)
+        else:
+            num_input_tokens = 0
+            num_labels = 0
+        
+        # Flag to track if this rank hit OOM
+        local_oom = torch.tensor([0], device=inputs["input_ids"].device if "input_ids" in inputs else "cuda")
+        loss = None
+        
         try:
-            # Print token usage for this training step
-            if "input_ids" in inputs:
-                num_input_tokens = inputs["input_ids"].shape[1]
-                num_labels = (inputs["labels"] != -100).sum().item()
-                num_images = inputs.get("pixel_values", torch.tensor([])).shape[0] if "pixel_values" in inputs else 0
-                
-                # Track for aggregation across gradient accumulation steps
-                self.step_token_counts.append(num_input_tokens)
-            
             # Run the standard training step
-            return super().training_step(model, inputs, num_items_in_batch)
+            loss = super().training_step(model, inputs, num_items_in_batch)
         except RuntimeError as e:
             if "out of memory" in str(e):
-                num_input_tokens = inputs["input_ids"].shape[1]
-                num_labels = (inputs["labels"] != -100).sum().item()
-                print(f"[OOM ERROR] Failed on {num_input_tokens} input tokens, {num_labels} label tokens. Step token history: {self.step_token_counts}")
-                self.step_token_counts = []  # Reset
+                local_oom[0] = 1
+                print(f"[OOM ERROR] Rank {dist.get_rank() if dist.is_initialized() else 0} failed on {num_input_tokens} input tokens, {num_labels} label tokens. Step token history: {self.step_token_counts}")
                 # Clear the CUDA cache to recover memory
                 torch.cuda.empty_cache()
-                return torch.tensor(0.0, device=next(model.parameters()).device)
             else:
                 raise e  # Re-raise if it's not an OOM error
+        
+        # Synchronize OOM status across all ranks
+        # If ANY rank hit OOM, all ranks should return zero loss
+        if dist.is_initialized():
+            dist.all_reduce(local_oom, op=dist.ReduceOp.MAX)
+        
+        if local_oom[0] > 0:
+            # At least one rank hit OOM - all ranks return zero loss
+            if dist.is_initialized() and dist.get_rank() == 0:
+                print(f"[OOM SYNC] At least one rank hit OOM, all ranks skipping this step")
+            self.step_token_counts = []  # Reset
+            torch.cuda.empty_cache()
+            return torch.tensor(0.0, device=inputs["input_ids"].device if "input_ids" in inputs else "cuda", requires_grad=True)
+        
+        return loss
 
 
 def main():
@@ -883,7 +943,7 @@ def main():
     parser.add_argument(
         "--branch_generated_root",
         type=str,
-        default="/gpfs/radev/home/jw3278/scratch/branch_generated_verified_done",
+        default="/gpfs/radev/home/jw3278/scratch/branch_generated_verified",
         help=(
             "Root directory containing branch-generated trajectories "
             "(each subdirectory should contain metadata.json, trajectory.jsonl, and screenshots/). "
@@ -891,9 +951,30 @@ def main():
         ),
     )
     parser.add_argument(
+        "--branch_generated_half_verified_root",
+        type=str,
+        default="/gpfs/radev/home/jw3278/scratch/branch_generated_half_verified",
+        help=(
+            "Optional root directory containing half-verified branch-generated trajectories. "
+            "If provided, these branches will be added to the training dataset in addition to "
+            "--branch_generated_root. For these tasks, only post-branch (non-replay) steps are "
+            "used, and the task description is taken from `new_task_description`."
+        ),
+    )
+    parser.add_argument(
+        "--include_half_verified",
+        action="store_true",
+        default=False,
+        help=(
+            "If set, include trajectories from --branch_generated_half_verified_root "
+            "in the training data. If not set, only data from --branch_generated_root "
+            "is used."
+        ),
+    )
+    parser.add_argument(
         "--max_past_screenshots",
         type=int,
-        default=2,
+        default=0,
         help=(
             "Maximum number of past screenshots (steps) to include in the prompt, "
             "in addition to the current step. Default is 2. "
@@ -946,9 +1027,15 @@ def main():
         raise ValueError(
             "You must provide --branch_generated_root pointing to the branch_generated directory."
         )
+    if args.include_half_verified:
+        half_verified_root = args.branch_generated_half_verified_root
+    else:
+        half_verified_root = None
+
     train_dataset = create_branch_generated_dataset(
         args.branch_generated_root,
-        dual_training_types=args.dual_training_types
+        dual_training_types=args.dual_training_types,
+        half_verified_root=half_verified_root,
     )
 
     # Shuffle the dataset to ensure Type 1 and Type 2 examples of the same step
@@ -1024,8 +1111,8 @@ def main():
         processor.save_pretrained(pre_ft_ckpt_dir)
     accelerator.wait_for_everyone()
 
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    model = model.to(f"cuda:{local_rank}")
+    # local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    # model = model.to(f"cuda:{local_rank}")
 
     trainer = SafeTrainer(
         model=model,

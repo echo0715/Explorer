@@ -7,9 +7,14 @@ from PIL import Image
 from tqdm import tqdm
 import traceback
 import json
+from typing import Optional
 
 
-def create_branch_generated_dataset(branch_root: str, dual_training_types: bool = True) -> Dataset:
+def create_branch_generated_dataset(
+    branch_root: str,
+    dual_training_types: bool = True,
+    half_verified_root: Optional[str] = None,
+) -> Dataset:
     """
     Create a HuggingFace Dataset from branch-generated trajectories.
 
@@ -53,54 +58,80 @@ def create_branch_generated_dataset(branch_root: str, dual_training_types: bool 
     if not os.path.isdir(branch_root):
         raise ValueError(f"branch_root does not exist or is not a directory: {branch_root}")
 
+    if half_verified_root is not None and not os.path.isdir(half_verified_root):
+        raise ValueError(
+            f"half_verified_root was provided but does not exist or is not a directory: {half_verified_root}"
+        )
+
     # ------------------------------------------------------------------
     # First pass: collect all branches and their metadata so we can
     # determine, for LibreOffice domains, which branches should KEEP
     # replay steps and which should DROP them.
+    #
+    # We treat:
+    #   - entries from `branch_root` as source == "main"
+    #   - entries from `half_verified_root` (if provided) as source == "half_verified"
+    #
+    # The LibreOffice "max branch keeps replay" logic only looks at
+    # branches from the main root so that adding half-verified data
+    # does not change the behavior of existing training branches.
     # ------------------------------------------------------------------
     branch_infos = []
 
-    for dir_name in sorted(os.listdir(branch_root)):
-        dir_path = os.path.join(branch_root, dir_name)
-        if not os.path.isdir(dir_path):
-            continue
+    def _collect_branch_infos(root: str, source: str) -> None:
+        for dir_name in sorted(os.listdir(root)):
+            dir_path = os.path.join(root, dir_name)
+            if not os.path.isdir(dir_path):
+                continue
 
-        metadata_path = os.path.join(dir_path, "metadata.json")
-        traj_path = os.path.join(dir_path, "trajectory.jsonl")
-        screenshots_dir = os.path.join(dir_path, "screenshots")
+            metadata_path = os.path.join(dir_path, "metadata.json")
+            traj_path = os.path.join(dir_path, "trajectory.jsonl")
+            screenshots_dir = os.path.join(dir_path, "screenshots")
 
-        if not (os.path.isfile(metadata_path) and os.path.isfile(traj_path)):
-            # Skip directories that do not contain both metadata and trajectory
-            continue
+            if not (os.path.isfile(metadata_path) and os.path.isfile(traj_path)):
+                # Skip directories that do not contain both metadata and trajectory
+                continue
 
-        try:
-            with open(metadata_path, "r") as f:
-                metadata = json.load(f)
-        except Exception as e:
-            print(f"[create_branch_generated_dataset] Failed to read {metadata_path}: {e}")
-            continue
+            try:
+                with open(metadata_path, "r") as f:
+                    metadata = json.load(f)
+            except Exception as e:
+                print(f"[create_branch_generated_dataset] Failed to read {metadata_path}: {e}")
+                continue
 
-        branch_infos.append(
-            {
-                "dir_path": dir_path,
-                "metadata_path": metadata_path,
-                "traj_path": traj_path,
-                "screenshots_dir": screenshots_dir,
-                "metadata": metadata,
-            }
-        )
+            branch_infos.append(
+                {
+                    "dir_path": dir_path,
+                    "metadata_path": metadata_path,
+                    "traj_path": traj_path,
+                    "screenshots_dir": screenshots_dir,
+                    "metadata": metadata,
+                    "source": source,
+                }
+            )
+
+    # Always collect from the main root
+    _collect_branch_infos(branch_root, source="main")
+    # Optionally, also collect half-verified branches
+    if half_verified_root is not None:
+        _collect_branch_infos(half_verified_root, source="half_verified")
 
     # Map from branch dir to whether we should keep replay steps when
     # building the training data. Default is True (keep replays).
     include_replay_for_branch: dict[str, bool] = {}
 
     # Only apply the "drop replay steps for non-max branches" logic to
-    # LibreOffice domains, grouped by original_task_id.
+    # LibreOffice domains, grouped by original_task_id, and *only* for
+    # branches coming from the main root. Half-verified branches are
+    # always treated as "drop replay, keep only post-branch steps".
     target_domains = {"libreoffice_calc", "libreoffice_impress", "libreoffice_writer"}
     branches_by_original_id: dict[str, list[dict]] = {}
 
     for info in branch_infos:
         metadata = info["metadata"]
+        if info.get("source") != "main":
+            # Only main-root branches participate in the max-branch selection.
+            continue
         domain = metadata.get("domain")
         if domain not in target_domains:
             continue
@@ -138,19 +169,50 @@ def create_branch_generated_dataset(branch_root: str, dual_training_types: bool 
         # Look up this flag before deciding which task description to use.
         include_replay = include_replay_for_branch.get(dir_path, True)
 
+        source = info.get("source", "main")
         domain = metadata.get("domain")
-        # For non-max LibreOffice branches (where we drop replay steps),
-        # use the human-edited `new_task_description` instead of the
-        # VLLM-generated one. For all other branches, keep the original
-        # behavior.
-        if not include_replay and domain in target_domains:
+
+        # Half-verified branches:
+        #   - always drop replay steps (use only post-branch steps)
+        #   - always prefer the human-edited `new_task_description`
+        if source == "half_verified":
+            include_replay = False
             task_description = metadata.get(
                 "new_task_description",
                 metadata.get("generated_task_description_from_vllm", ""),
             )
         else:
-            task_description = metadata.get("generated_task_description_from_vllm", "")
+            # For non-max LibreOffice branches (where we drop replay steps),
+            # use the human-edited `new_task_description` instead of the
+            # VLLM-generated one. For all other branches, keep the original
+            # behavior.
+            if not include_replay and domain in target_domains:
+                task_description = metadata.get(
+                    "new_task_description",
+                    metadata.get("generated_task_description_from_vllm", ""),
+                )
+            else:
+                task_description = metadata.get("generated_task_description_from_vllm", "")
         num_replay_steps = int(metadata.get("num_replay_steps", 0))
+
+        # For replay steps, we may have additional metadata describing how the
+        # reasoning was backfilled (e.g., "candidate_match" vs "fallback_direct").
+        # We only want to create supervised training targets from replay steps
+        # whose backfill method is "candidate_match", but we still want ALL
+        # replay steps to appear in the trajectory/history so that later steps
+        # can see their reasoning as context.
+        replay_reasoning_backfill = metadata.get("replay_reasoning_backfill", {}) or {}
+        replay_updated_steps = replay_reasoning_backfill.get("updated_steps", {}) or {}
+        # Map from 1-based replay step index -> backfill method string
+        replay_method_by_index: dict[int, str] = {}
+        for k, v in replay_updated_steps.items():
+            try:
+                idx_int = int(k)
+            except (TypeError, ValueError):
+                continue
+            method = v.get("method")
+            if isinstance(method, str):
+                replay_method_by_index[idx_int] = method
 
         # First, parse all steps for this branch.
         steps = []
@@ -201,6 +263,21 @@ def create_branch_generated_dataset(branch_root: str, dual_training_types: bool 
                     if step_id is None:
                         step_id = line_index
 
+                    # Decide whether to skip creating training examples for this step.
+                    # - We always keep the step in `steps` (so it shows up in
+                    #   `all_steps` and its reasoning can contribute to history).
+                    # - If skip=True, we will not create supervised training
+                    #   examples for this step later on.
+                    skip_flag = record.get("skip", False)
+                    if is_replay:
+                        # For replay steps, if the backfill method is present and
+                        # not "candidate_match" (e.g., "fallback_direct"), then we
+                        # only want this step for context, not as a supervised
+                        # training target.
+                        replay_method = replay_method_by_index.get(line_index)
+                        if replay_method is not None and replay_method != "candidate_match":
+                            skip_flag = True
+
                     step_entry = {
                         "step": step_id,
                         "is_replay": is_replay,
@@ -214,7 +291,7 @@ def create_branch_generated_dataset(branch_root: str, dual_training_types: bool 
                         "done": record.get("done", False),
                         # If skip is True, we still include this step in the trajectory
                         # (for context/history), but don't create training examples from it
-                        "skip": record.get("skip", False),
+                        "skip": skip_flag,
                     }
                     steps.append(step_entry)
         except Exception as e:

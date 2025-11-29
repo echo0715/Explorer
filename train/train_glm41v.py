@@ -6,22 +6,13 @@ from pathlib import Path
 
 import torch
 from accelerate import Accelerator
+import transformers
 from transformers import (
     AutoProcessor,
+    AutoModelForCausalLM,
     Trainer,
     TrainingArguments,
-    Qwen2VLForConditionalGeneration,
-    Qwen3VLForConditionalGeneration,
 )
-
-# Qwen 2.5 VL models use a different architecture (`model_type="qwen2_5_vl"`)
-# from Qwen 2 VL (`model_type="qwen2_vl"`), so we should use the dedicated
-# Qwen2_5_VLForConditionalGeneration class when available. Older versions of
-# `transformers` may not expose it, so we import it conditionally.
-try:
-    from transformers import Qwen2_5_VLForConditionalGeneration  # type: ignore
-except ImportError:  # pragma: no cover - older transformers versions
-    Qwen2_5_VLForConditionalGeneration = None  # type: ignore
 
 from PIL import Image
 import re
@@ -29,7 +20,7 @@ from train_utils import create_branch_generated_dataset
 
 random.seed(123937)
 
-# suggested deepspeed config
+# suggested deepspeed config (same as Qwen/LLaMA scripts)
 DS_CONFIG_DICT = {
     "zero_optimization": {
         "stage": 3,
@@ -42,12 +33,11 @@ DS_CONFIG_DICT = {
         "round_robin_gradients": True,
         "stage3_gather_16bit_weights_on_model_save": True,
         # Enable ZeRO-3 parameter CPU offloading to reduce GPU memory usage
-        # while keeping the optimizer on GPU to avoid compiling DeepSpeed CPUAdam,
-        # which requires a newer GCC than is available on this cluster.
-        "offload_param": {
-            "device": "cpu",
-            "pin_memory": True,
-        }
+        # while keeping the optimizer on GPU.
+        # "offload_param": {
+        #     "device": "cpu",
+        #     "pin_memory": True,
+        # },
     },
     "fp16": {
         "enabled": "auto",
@@ -64,51 +54,74 @@ DS_CONFIG_DICT = {
     "gradient_clipping": "auto",
 }
 
-def create_model(model_name_or_path, model_type="qwen3vl", use_flash_attention=False, cache_dir=None):
+
+def create_model(model_name_or_path, use_flash_attention=False, cache_dir=None):
     """
-    Create a Qwen VL model for training.
-    
+    Create a GLM-4.1V model for training.
+
     Args:
         model_name_or_path: Path to the pretrained model or HuggingFace model ID
-        model_type: One of:
-            - "qwen2vl":     Qwen 2 VL models (e.g., Qwen/Qwen2-VL-7B-Instruct)
-            - "qwen2_5_vl":  Qwen 2.5 VL models (e.g., Qwen/Qwen2.5-VL-7B-Instruct)
-            - "qwen3vl":     Qwen 3 VL models (e.g., Qwen/Qwen3-VL-8B-Instruct)
+            (e.g., zai-org/GLM-4.1V-9B-Base)
         use_flash_attention: Whether to use Flash Attention 2
         cache_dir: Directory to cache downloaded models
     """
 
-    # Normalize a few common aliases for Qwen 2.5 VL.
-    if model_type in {"qwen2.5vl", "qwen2.5_vl"}:
-        model_type = "qwen2_5_vl"
-
-    if model_type == "qwen2vl":
-        model_class = Qwen2VLForConditionalGeneration
-    elif model_type == "qwen2_5_vl":
-        if Qwen2_5_VLForConditionalGeneration is None:
-            raise ImportError(
-                "Qwen 2.5 VL models require `Qwen2_5_VLForConditionalGeneration`, "
-                "which is not available in your `transformers` installation. "
-                "Please upgrade `transformers`, or use `--model_type qwen2vl` "
-                "with a Qwen 2 VL checkpoint such as `Qwen/Qwen2-VL-7B-Instruct`."
-            )
-        model_class = Qwen2_5_VLForConditionalGeneration  # type: ignore
-    elif model_type == "qwen3vl":
-        model_class = Qwen3VLForConditionalGeneration
-    else:
-        raise ValueError(
-            f"Unsupported model_type: {model_type}. Must be one of "
-            f"'qwen2vl', 'qwen2_5_vl', or 'qwen3vl'"
+    # First, try the standard AutoModelForCausalLM path. On sufficiently
+    # recent versions of `transformers`, GLM-4.1V will be wired into this
+    # auto-mapping and this will Just Work.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            torch_dtype=torch.bfloat16,
+            cache_dir=cache_dir,
+            trust_remote_code=True,
+            attn_implementation="flash_attention_2" if use_flash_attention else None,
         )
-    
-    model = model_class.from_pretrained(
-        model_name_or_path,
-        torch_dtype=torch.float16,
-        cache_dir=cache_dir,
-        attn_implementation="flash_attention_2" if use_flash_attention else None,
-    )
+        return model
+    except ValueError as e:
+        # On some cluster installs, GLM-4.1V's config (`Glm4vConfig`) may be
+        # present but not yet registered with AutoModelForCausalLM, which
+        # triggers a ValueError like the one you saw. In that case, fall back
+        # to locating the dedicated glm4v model class directly.
+        if "Glm4vConfig" not in str(e):
+            raise
 
-    return model
+        # Best-effort fallback: introspect `transformers.models.glm4v` to find
+        # a *ForCausalLM / *ForConditionalGeneration style class and use it.
+        try:
+            glm4v_mod = transformers.models.glm4v.modeling_glm4v  # type: ignore[attr-defined]
+        except Exception as inner_exc:
+            raise RuntimeError(
+                "Your installed `transformers` appears to know about Glm4vConfig "
+                "but does not expose a glm4v modeling module compatible with "
+                "AutoModelForCausalLM. Consider upgrading `transformers` to a "
+                "newer version."
+            ) from inner_exc
+
+        candidate_cls = None
+        for name in dir(glm4v_mod):
+            lower = name.lower()
+            if lower.startswith("glm4vfor") and (
+                "causallm" in lower or "conditionalgeneration" in lower
+            ):
+                cls = getattr(glm4v_mod, name)
+                if hasattr(cls, "from_pretrained"):
+                    candidate_cls = cls
+                    break
+
+        if candidate_cls is None:
+            raise RuntimeError(
+                "Could not locate a GLM-4.1V generation class (e.g., Glm4vForCausalLM) "
+                "inside `transformers.models.glm4v`. Please upgrade `transformers`."
+            ) from e
+
+        model = candidate_cls.from_pretrained(  # type: ignore[call-arg]
+            model_name_or_path,
+            torch_dtype=torch.bfloat16,
+            cache_dir=cache_dir,
+            attn_implementation="flash_attention_2" if use_flash_attention else None,
+        )
+        return model
 
 
 def build_system_prompt(coordinate_type="relative", processed_width=1000, processed_height=1000):
@@ -148,36 +161,47 @@ def build_system_prompt(coordinate_type="relative", processed_width=1000, proces
         """
 
     tools_def = {
-        "type": "function", 
+        "type": "function",
         "function": {
-            "name_for_human": "computer_use", 
-            "name": "computer_use", 
+            "name_for_human": "computer_use",
+            "name": "computer_use",
             "description": description_prompt,
             "parameters": {
                 "properties": {
                     "action": {
                         "description": action_description_prompt,
-                        "enum": ["key", "type", "mouse_move", "left_click", "left_click_drag", 
-                                 "right_click", "middle_click", "double_click", "scroll", "wait", "terminate"], 
-                        "type": "string"
+                        "enum": [
+                            "key",
+                            "type",
+                            "mouse_move",
+                            "left_click",
+                            "left_click_drag",
+                            "right_click",
+                            "middle_click",
+                            "double_click",
+                            "scroll",
+                            "wait",
+                            "terminate",
+                        ],
+                        "type": "string",
                     },
-                    "keys": {"description": "Required only by `action=key`.", "type": "array"}, 
-                    "text": {"description": "Required only by `action=type`.", "type": "string"}, 
-                    "coordinate": {"description": "The x,y target coordinates for mouse actions.", "type": "array"}, 
+                    "keys": {"description": "Required only by `action=key`.", "type": "array"},
+                    "text": {"description": "Required only by `action=type`.", "type": "string"},
+                    "coordinate": {"description": "The x,y target coordinates for mouse actions.", "type": "array"},
                     "start_coordinate": {"description": "The x,y starting coordinates for drag actions.", "type": "array"},
-                    "pixels": {"description": "The amount of scrolling.", "type": "number"}, 
-                    "time": {"description": "The seconds to wait.", "type": "number"}, 
+                    "pixels": {"description": "The amount of scrolling.", "type": "number"},
+                    "time": {"description": "The seconds to wait.", "type": "number"},
                     "status": {
-                        "description": "The status of the task.", 
-                        "type": "string", 
-                        "enum": ["success", "failure"]
-                    }
-                }, 
-                "required": ["action"], 
-                "type": "object"
-            }, 
-            "args_format": "Format the arguments as a JSON object."
-        }
+                        "description": "The status of the task.",
+                        "type": "string",
+                        "enum": ["success", "failure"],
+                    },
+                },
+                "required": ["action"],
+                "type": "object",
+            },
+            "args_format": "Format the arguments as a JSON object.",
+        },
     }
 
     system_prompt = """# Tools
@@ -209,9 +233,9 @@ Rules:
     return system_prompt
 
 
-class BranchGeneratedQwenCollator:
+class BranchGeneratedGLMCollator:
     """
-    Data collator for training Qwen VL models (Qwen 2.x VL and Qwen 3 VL) on branch-generated 
+    Data collator for training GLM-4.1V models on branch-generated
     trajectories, one target step per example, using multi-step, multi-image chat histories.
 
     Expects each dataset example to have the following fields (as created by
@@ -240,11 +264,11 @@ class BranchGeneratedQwenCollator:
     def _build_tool_call_from_action_dict(self, step):
         """
         Convert a high-level action_dict from the dataset into a tool-call JSON
-        compatible with Qwen3VLAgent.parse_response, of the form:
+        of the form:
             {"name": "computer_use", "arguments": {...}}
 
         Note: Training data coordinates are in 1280x720 pixel space. At runtime,
-        Qwen3VLAgent with coordinate_type="relative" expects coordinates on a
+        the agent with coordinate_type="relative" expects coordinates on a
         0..999 grid in both x and y, which it then scales to the actual screen
         size. Here we convert 1280x720 pixel coordinates into this 0..999
         relative grid so that training and inference use the same convention.
@@ -273,7 +297,7 @@ class BranchGeneratedQwenCollator:
         if not raw_action_type:
             return None
 
-        # Map triple_click → double_click since Qwen3VLAgent uses double_click
+        # Map triple_click → double_click
         if raw_action_type == "triple_click":
             action_type = "double_click"
         else:
@@ -282,19 +306,11 @@ class BranchGeneratedQwenCollator:
         arguments = {"action": action_type}
 
         # Helper function to scale coordinates from 1280x720 absolute pixels
-        # into a 0..999 relative integer grid, matching Qwen3VLAgent when
-        # coordinate_type == "relative".
+        # into a 0..999 relative integer grid.
         def scale_coordinate_to_relative(coord):
             """
             Scale coordinate from 1280x720 pixel space into 0..999 relative
             integer space.
-
-            The agent's parse_response() assumes that for relative coordinates:
-                x_screen = x_rel * (original_width / 999)
-                y_screen = y_rel * (original_height / 999)
-            So here we normalize the recorded 1280x720 coordinates into that
-            0..999 range and then round to integers before returning, so the
-            model always sees integer coordinates.
             """
             if isinstance(coord, (list, tuple)) and len(coord) == 2:
                 base_w, base_h = 1280.0, 720.0
@@ -332,9 +348,6 @@ class BranchGeneratedQwenCollator:
             "mouse_move",
             "left_click_drag",
         ):
-            # For drag actions, we want to preserve both the start and end
-            # coordinates so the model learns to move to the start and then
-            # drag to the end, matching the pyautogui sequence in the data.
             if action_type == "left_click_drag":
                 start_coord = input_dict.get("start_coordinate")
                 end_coord = input_dict.get("coordinate")
@@ -343,7 +356,6 @@ class BranchGeneratedQwenCollator:
                     arguments["start_coordinate"] = scale_coordinate_to_relative(start_coord)
 
                 # If no explicit end_coord is provided, fall back to start_coord
-                # so that we still have a valid target.
                 if isinstance(end_coord, (list, tuple)) and len(end_coord) == 2:
                     arguments["coordinate"] = scale_coordinate_to_relative(end_coord)
                 else:
@@ -355,15 +367,10 @@ class BranchGeneratedQwenCollator:
                     # certain mouse actions; fall back to that if present.
                     coord = input_dict.get("start_coordinate")
                 if isinstance(coord, (list, tuple)) and len(coord) == 2:
-                    # Scale from 1280x720 absolute pixels into 0..999 relative
-                    # coordinates so that training matches Qwen3VLAgent with
-                    # coordinate_type="relative".
                     arguments["coordinate"] = scale_coordinate_to_relative(coord)
 
             if action_type == "left_click_drag":
                 duration = input_dict.get("duration", 0.5)
-                # Some trajectories may explicitly store duration as null/None.
-                # In that case, or if casting fails, fall back to a sane default.
                 if duration is None:
                     duration = 0.5
                 try:
@@ -419,24 +426,18 @@ class BranchGeneratedQwenCollator:
         # Increment call counter for optional debug printing
         self._call_count += 1
 
-        assert (
-            len(data) == 1
-        ), f"BranchGeneratedQwenCollator only supports batch_size == 1, got {len(data)}"
+        assert len(data) == 1, f"BranchGeneratedGLMCollator only supports batch_size == 1, got {len(data)}"
         example = data[0]
 
         overall_task = example["task_description"]
-        # Text-only history from the dataset (kept for backward compatibility).
-        text_history = example.get("history", "")
-
         all_steps = example.get("all_steps", None)
         current_step_idx = example.get("current_step_idx", None)
 
-        # Build system prompt exactly as qwen3vl_agent does
-        # Training uses 1920x1080 images, coordinate_type defaults to "relative"
+        # Build system prompt (same content as Qwen/LLaMA agents)
         system_prompt_text = build_system_prompt(
             coordinate_type="relative",
             processed_width=1920,
-            processed_height=1080
+            processed_height=1080,
         )
 
         system_message = {
@@ -448,63 +449,54 @@ class BranchGeneratedQwenCollator:
 
         branch_dir = example["branch_dir"]
 
-        # Helper to load and resize a screenshot for a given step entry.
-        # Note: To predict a step's action, we need to see the screenshot from the PREVIOUS step,
-        # since the screenshot shows the state AFTER the previous action was executed.
+        # Helper to load a screenshot for a given step entry.
+        # To predict a step's action, we need the screenshot from the PREVIOUS step,
+        # since it shows the state AFTER the previous action was executed.
         def load_step_image(step_entry):
             step_id_local = step_entry.get("step")
             is_replay_local = step_entry.get("is_replay", False)
-            
-            # For predicting an action, we need the screenshot from the previous step
+
             if is_replay_local:
-                # For replay step N, we need the screenshot from replay step N-1
+                # For replay step N, use screenshot from replay step N-1
                 prev_step_id = step_id_local - 1
-                img_path = os.path.join(
+                img_path_local = os.path.join(
                     branch_dir, "screenshots", f"step_{prev_step_id}_replay.png"
                 )
             else:
-                # For non-replay step N, we need the screenshot from step N-1
-                # If step N is 1, we need the last replay step (step 0 doesn't exist for non-replay)
+                # For non-replay step N, use screenshot from step N-1.
+                # If step N is 1, fall back to last replay step.
                 prev_step_id = step_id_local - 1
                 if prev_step_id < 1:
-                    # For step 1, we need to find the last replay step
-                    # We'll look for the highest numbered replay step
                     replay_screenshots = []
-                    screenshots_dir = os.path.join(branch_dir, "screenshots")
-                    if os.path.exists(screenshots_dir):
-                        for filename in os.listdir(screenshots_dir):
+                    screenshots_dir_local = os.path.join(branch_dir, "screenshots")
+                    if os.path.exists(screenshots_dir_local):
+                        for filename in os.listdir(screenshots_dir_local):
                             if filename.endswith("_replay.png"):
                                 match = re.match(r"step_(\d+)_replay\.png", filename)
                                 if match:
                                     replay_screenshots.append(int(match.group(1)))
                     if replay_screenshots:
                         last_replay_step = max(replay_screenshots)
-                        img_path = os.path.join(
+                        img_path_local = os.path.join(
                             branch_dir, "screenshots", f"step_{last_replay_step}_replay.png"
                         )
                     else:
-                        # Fallback: if no replay steps exist, use step_0_replay.png
-                        img_path = os.path.join(
-                            branch_dir, "screenshots", f"step_0_replay.png"
+                        img_path_local = os.path.join(
+                            branch_dir, "screenshots", "step_0_replay.png"
                         )
                 else:
-                    img_path = os.path.join(
+                    img_path_local = os.path.join(
                         branch_dir, "screenshots", f"step_{prev_step_id}.png"
                     )
 
-            image_local = Image.open(img_path)
+            image_local = Image.open(img_path_local)
             # Use original 1920x1080 resolution without resizing
-            return image_local, img_path
+            return image_local, img_path_local
 
         messages = [system_message]
         images = []
 
-        # If we have full trajectory information, build a multi-turn chat history:
-        #   System
-        #   User (screenshot + instruction at earliest included step)
-        #   Assistant (reasoning+action for that step)
-        #   ...
-        #   User (screenshot for current step, clearly marked as CURRENT)
+        # Build multi-turn chat history if full trajectory information is available.
         use_full_history = all_steps is not None and current_step_idx is not None
 
         if use_full_history:
@@ -513,7 +505,7 @@ class BranchGeneratedQwenCollator:
                 max_past = 0
             max_past = max(0, int(max_past))
 
-            # Select a window of past steps to include, ending right before the current step.
+            # Window of past steps ending just before the current step.
             start_idx = max(0, current_step_idx - max_past)
 
             for idx in range(start_idx, current_step_idx):
@@ -526,9 +518,8 @@ class BranchGeneratedQwenCollator:
 
                 images.append(prev_image)
 
-                # Build instruction_prompt for the first history step only, matching qwen3vl_agent
                 if idx == start_idx:
-                    # Build previous actions string for this step
+                    # Instruction + previous actions string
                     prev_actions_for_this_step = []
                     for i in range(idx):
                         if i < len(all_steps):
@@ -541,23 +532,25 @@ class BranchGeneratedQwenCollator:
                                 f"Step {i+1} reasoning: {prev_desc_i}"
                             )
                     previous_actions_str = (
-                        "\n".join(prev_actions_for_this_step) if prev_actions_for_this_step else "None"
+                        "\n".join(prev_actions_for_this_step)
+                        if prev_actions_for_this_step
+                        else "None"
                     )
-                    
-                    instruction_prompt = f"""
+
+                    instruction_prompt_hist = f"""
 Please generate the next move according to the UI screenshot, instruction and previous actions.
 
 Instruction: {overall_task}
 
 Previous actions:
 {previous_actions_str}"""
-                    
+
                     messages.append(
                         {
                             "role": "user",
                             "content": [
                                 {"type": "image"},
-                                {"type": "text", "text": instruction_prompt},
+                                {"type": "text", "text": instruction_prompt_hist},
                             ],
                         }
                     )
@@ -567,25 +560,36 @@ Previous actions:
                         {
                             "role": "user",
                             "content": [
-                                {"type": "image"}
+                                {"type": "image"},
                             ],
                         }
                     )
 
-                # Assistant response: Action: + <tool_call> format
-                # Prefer action_proposal (short imperative) over full reasoning text
+                # Assistant response for this past step
                 reasoning = prev_step.get("reasoning", "") or prev_step.get(
                     "action_proposal", ""
                 )
                 tool_call_json = self._build_tool_call_from_action_dict(prev_step)
-                
+
                 if tool_call_json:
-                    action_line = f"Step {idx+1} reasoning: {reasoning}" if reasoning else "Step {idx+1} reasoning: Perform action"
-                    tool_call_text = f"<tool_call>\n{json.dumps(tool_call_json, ensure_ascii=False)}\n</tool_call>"
+                    action_line = (
+                        f"Step {idx+1} reasoning: {reasoning}"
+                        if reasoning
+                        else "Step {idx+1} reasoning: Perform action"
+                    )
+                    tool_call_text = (
+                        "<tool_call>\n"
+                        + json.dumps(tool_call_json, ensure_ascii=False)
+                        + "\n</tool_call>"
+                    )
                     assistant_text = f"{action_line}\n{tool_call_text}"
                 else:
-                    assistant_text = f"Step {idx+1} reasoning: {reasoning}" if reasoning else "Step {idx+1} reasoning: Continue"
-                
+                    assistant_text = (
+                        f"Step {idx+1} reasoning: {reasoning}"
+                        if reasoning
+                        else "Step {idx+1} reasoning: Continue"
+                    )
+
                 messages.append(
                     {
                         "role": "assistant",
@@ -595,12 +599,10 @@ Previous actions:
                     }
                 )
 
-        # Each dataset example still corresponds to exactly one (current) step.
+        # Each dataset example corresponds to exactly one (current) step.
         step = example["step"]
 
-        # Load the screenshot for the current step
-        # Note: load_step_image already handles loading the previous step's screenshot,
-        # since to predict step N's action, we need to see the state from step N-1
+        # Load the screenshot for the current step (previous state's image).
         try:
             current_image, image_path = load_step_image(step)
         except FileNotFoundError:
@@ -608,7 +610,7 @@ Previous actions:
 
         images.append(current_image)
 
-        # Build previous_actions_str for the current step, matching qwen3vl_agent format
+        # Build previous_actions_str for the current step
         previous_actions = []
         if use_full_history and current_step_idx is not None:
             for i in range(current_step_idx):
@@ -619,9 +621,11 @@ Previous actions:
                         or prev_step_i.get("action_proposal", "")
                     )
                     previous_actions.append(f"Step {i+1} reasoning: {prev_desc_i}")
-        previous_actions_str = "\n".join(previous_actions) if previous_actions else "None"
+        previous_actions_str = (
+            "\n".join(previous_actions) if previous_actions else "None"
+        )
 
-        # Build instruction_prompt exactly as qwen3vl_agent does
+        # Instruction prompt for the current step
         instruction_prompt = f"""
 Please generate the next move according to the UI screenshot, instruction and previous actions.
 
@@ -630,22 +634,19 @@ Instruction: {overall_task}
 Previous actions:
 {previous_actions_str}"""
 
-        # Final user turn: matches qwen3vl_agent structure
-        # If this is the first message (no history), include both image and text
-        # If we have history, just add the current image (text was in first history message)
-        if use_full_history and current_step_idx > 0:
-            # We already added instruction_prompt in the first history message,
-            # so just add the current screenshot
+        # Final user turn
+        if use_full_history and current_step_idx is not None and current_step_idx > 0:
+            # Instruction already in first history message → only image
             messages.append(
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image"}
+                        {"type": "image"},
                     ],
                 }
             )
         else:
-            # No history or first step: add both image and instruction
+            # No history or first step: include both image and instruction text
             messages.append(
                 {
                     "role": "user",
@@ -656,119 +657,126 @@ Previous actions:
                 }
             )
 
-        # Get training type from the example (set during dataset creation)
-        # Type 1: predict action_proposal + action
-        # Type 2: given action_proposal, predict action only
+        # Training types:
+        #   Type 1: predict (action_proposal + action)
+        #   Type 2: given action_proposal, predict action only
         training_type = example.get("training_type", "type1")
-        use_type_2 = (training_type == "type2")
-        
-        # For Type 2, add action_proposal to the input prompt
+        use_type_2 = training_type == "type2"
+
+        # For Type 2, append action_proposal to the user input
         if use_type_2:
-            action_text = step.get("reasoning", "") or step.get("action_proposal", "")
-            if action_text:
-                # Add action_proposal as part of the user's query
-                action_proposal_prompt = f"\nReasoning: {action_text}\n"
-                # Add to the last user message
-                messages[-1]["content"].append({"type": "text", "text": action_proposal_prompt})
-        
+            action_text_in = step.get("reasoning", "") or step.get(
+                "action_proposal", ""
+            )
+            if action_text_in:
+                action_proposal_prompt = f"\nReasoning: {action_text_in}\n"
+                messages[-1]["content"].append(
+                    {"type": "text", "text": action_proposal_prompt}
+                )
+
+        # Let the GLM processor build the multimodal prompt
         prompt = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
 
-
         batch = self.processor(
-            text=[prompt], images=[images], padding=True, return_tensors="pt"
+            text=[prompt],
+            images=[images],
+            padding=True,
+            return_tensors="pt",
         )
 
-        input_ids = [batch["input_ids"]]
-        labels = [torch.tensor([-100] * len(batch["input_ids"][0])).unsqueeze(0)]
-        image_grid_thw = batch["image_grid_thw"]
+        # Start with prompt tokens; target labels are -100 for the prompt part
+        input_ids_list = [batch["input_ids"]]
+        labels_list = [
+            torch.full(
+                (1, batch["input_ids"].shape[1]),
+                -100,
+                dtype=torch.long,
+            )
+        ]
 
-        # Build supervised target based on training type
+        # Build supervised target for this step
         action_text = step.get("reasoning", "") or step.get("action_proposal", "")
         tool_call = self._build_tool_call_from_action_dict(step)
 
-        # Build the textual target
         lines = []
-        
+
         if use_type_2:
-            # Type 2: Only output the tool_call (action_proposal was given in input)
+            # Type 2: Only output the tool_call (action_proposal already in input)
             if tool_call and isinstance(tool_call, dict):
                 lines.append("<tool_call>")
                 lines.append(json.dumps(tool_call, ensure_ascii=False))
                 lines.append("</tool_call>")
         else:
-            # Type 1: Output both action_proposal and tool_call
+            # Type 1: Reasoning + tool_call
             if action_text:
                 lines.append(f"Reasoning: {action_text}")
             else:
-                # Fallback description if we have no explicit reasoning.
                 if tool_call and isinstance(tool_call, dict):
                     args = tool_call.get("arguments", {}) or {}
                     act = args.get("action", "unknown")
                     lines.append(f"Reasoning: Perform {act} action")
                 else:
-                    lines.append("Reasoning: Decide the next action based on the screenshot.")
+                    lines.append(
+                        "Reasoning: Decide the next action based on the screenshot."
+                    )
 
             if tool_call and isinstance(tool_call, dict):
                 lines.append("<tool_call>")
                 lines.append(json.dumps(tool_call, ensure_ascii=False))
                 lines.append("</tool_call>")
 
-        answer = "\n".join(lines) + "<|im_end|>\n<|endoftext|>"
+        # For GLM we rely on tokenizer's EOS handling; no manual special tokens appended.
+        answer = "\n".join(lines)
 
         answer_input_ids = self.processor.tokenizer(
-            answer, add_special_tokens=False, return_tensors="pt"
+            answer,
+            add_special_tokens=False,
+            return_tensors="pt",
         )["input_ids"]
-        input_ids.append(answer_input_ids)
-        labels.append(answer_input_ids)
+
+        input_ids_list.append(answer_input_ids)
+        labels_list.append(answer_input_ids)
 
         assert "pixel_values" in batch, f"Image not found: {image_path}!!!\n"
 
-        input_ids = torch.cat(input_ids, dim=1)
-        labels = torch.cat(labels, dim=1)
-        pixel_values = batch["pixel_values"]
+        input_ids = torch.cat(input_ids_list, dim=1)
+        labels = torch.cat(labels_list, dim=1)
 
         attention_mask = torch.ones_like(input_ids)
 
-        batch = {
-            "input_ids": input_ids,
-            "labels": labels,
-            "pixel_values": pixel_values,
-            "image_grid_thw": image_grid_thw,
-            "attention_mask": attention_mask,
-        }
-
-        # Print token usage statistics
-        # print(f"[Debug] input_ids shape: {input_ids.shape}, labels shape: {labels.shape}")
-        # num_input_tokens = input_ids.shape[1]
-        # num_label_tokens = (labels[0] != -100).sum().item()
-        # num_images = len(images)
-        # print(f"[Token Usage] Input tokens: {num_input_tokens} | Label tokens: {num_label_tokens} | Images: {num_images}")
+        # Update batch with new text fields; keep any image-related keys as-is.
+        batch["input_ids"] = input_ids
+        batch["labels"] = labels
+        batch["attention_mask"] = attention_mask
 
         # ------------------------------------------------------------------
-        # Debug: print model input (prompt) and target output (answer).
-        #
-        # We only print for the first few batches and then every 100th batch
-        # to avoid flooding logs. Text is truncated for readability.
+        # Optional debug printing of input/output for a few batches.
         # ------------------------------------------------------------------
         if self._call_count <= 5 or self._call_count % 100 == 0:
             try:
-                training_type = "Type 2 (with action_proposal)" if use_type_2 else "Type 1 (predict action_proposal + action)"
-                
-                # Extract key information
+                training_type_str = (
+                    "Type 2 (with action_proposal)"
+                    if use_type_2
+                    else "Type 1 (predict action_proposal + action)"
+                )
+
                 step_id = step.get("step", "?")
                 is_replay = step.get("is_replay", False)
                 step_type = "Replay" if is_replay else "Regular"
                 num_images_used = len(images)
-                
+
                 print("\n" + "╔" + "=" * 98 + "╗")
-                print(f"║  TRAINING EXAMPLE #{self._call_count:04d} - {training_type:^60s}  ║")
+                print(
+                    f"║  TRAINING EXAMPLE #{self._call_count:04d} - {training_type_str:^60s}  ║"
+                )
                 print("╠" + "=" * 98 + "╣")
-                print(f"║  Step: {step_id} ({step_type}) | Images: {num_images_used} | Task: {overall_task[:45]:45s}  ║")
+                print(
+                    f"║  Step: {step_id} ({step_type}) | Images: {num_images_used} | Task: {overall_task[:45]:45s}  ║"
+                )
                 print("╠" + "=" * 98 + "╣")
-                
-                # Show the messages structure more clearly
+
                 print("║  MESSAGE STRUCTURE:")
                 for i, msg in enumerate(messages):
                     role = msg["role"]
@@ -776,46 +784,47 @@ Previous actions:
                     content_types = [item["type"] for item in content_items]
                     print(f"║    [{i}] {role:10s}: {', '.join(content_types)}")
                 print("╠" + "=" * 98 + "╣")
-                
-                # Show the full prompt (input to model)
+
                 print("║  MODEL INPUT PROMPT:")
                 print("╠" + "-" * 98 + "╣")
-                prompt_lines = prompt.split('\n')
-                for line in prompt_lines[:100]:  # Show first 100 lines
-                    # Truncate very long lines
+                prompt_lines = prompt.split("\n")
+                for line in prompt_lines[:100]:
                     if len(line) > 96:
                         print(f"║  {line[:93]}...")
                     else:
                         print(f"║  {line:96s}║")
                 if len(prompt_lines) > 100:
-                    print(f"║  ... [{len(prompt_lines) - 100} more lines omitted] ...")
-                
+                    print(
+                        f"║  ... [{len(prompt_lines) - 100} more lines omitted] ..."
+                    )
+
                 print("╠" + "=" * 98 + "╣")
-                
-                # Show the target answer (what model should output)
+
                 print("║  MODEL TARGET OUTPUT:")
                 print("╠" + "-" * 98 + "╣")
-                answer_lines = answer.split('\n')
+                answer_lines = answer.split("\n")
                 for line in answer_lines:
-                    # Truncate very long lines
                     if len(line) > 96:
                         print(f"║  {line[:93]}...")
                     else:
                         print(f"║  {line:96s}║")
-                
+
                 print("╠" + "=" * 98 + "╣")
-                
-                # Show token statistics
+
                 num_input_tokens = input_ids.shape[1]
                 num_label_tokens = (labels[0] != -100).sum().item()
-                print(f"║  TOKENS: Input={num_input_tokens:5d} | Labels={num_label_tokens:5d} | Images={num_images_used:2d}" + " " * 38 + "║")
-                
+                print(
+                    f"║  TOKENS: Input={num_input_tokens:5d} | Labels={num_label_tokens:5d} | Images={num_images_used:2d}"
+                    + " " * 38
+                    + "║"
+                )
+
                 print("╚" + "=" * 98 + "╝\n")
-                
+
             except Exception as e:
-                # Never break training because of debug printing
                 print(f"[Collator Debug] Failed to print input/output: {e}")
                 import traceback
+
                 traceback.print_exc()
 
         return batch
@@ -825,20 +834,20 @@ class SafeTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.step_token_counts = []  # Track tokens per GPU for current step
-    
+
     def training_step(self, model, inputs, num_items_in_batch=None):
         """
         Override training_step to handle OOM errors in a distributed-safe manner.
-        
+
         With DeepSpeed ZeRO-3, all ranks must execute the same forward pass because
         parameters are partitioned. If one rank hits OOM and returns early while
         others continue, DeepSpeed will detect a rank disagreement and crash.
-        
+
         Solution: Use torch.distributed to synchronize OOM status across all ranks.
         If ANY rank hits OOM, ALL ranks skip the step together.
         """
         import torch.distributed as dist
-        
+
         # Track token usage
         if "input_ids" in inputs:
             num_input_tokens = inputs["input_ids"].shape[1]
@@ -847,55 +856,57 @@ class SafeTrainer(Trainer):
         else:
             num_input_tokens = 0
             num_labels = 0
-        
+
         # Flag to track if this rank hit OOM
-        local_oom = torch.tensor([0], device=inputs["input_ids"].device if "input_ids" in inputs else "cuda")
+        local_oom = torch.tensor(
+            [0],
+            device=inputs["input_ids"].device
+            if "input_ids" in inputs
+            else "cuda",
+        )
         loss = None
-        
+
         try:
-            # Run the standard training step
             loss = super().training_step(model, inputs, num_items_in_batch)
         except RuntimeError as e:
             if "out of memory" in str(e):
                 local_oom[0] = 1
-                print(f"[OOM ERROR] Rank {dist.get_rank() if dist.is_initialized() else 0} failed on {num_input_tokens} input tokens, {num_labels} label tokens. Step token history: {self.step_token_counts}")
-                # Clear the CUDA cache to recover memory
+                print(
+                    f"[OOM ERROR] Rank {dist.get_rank() if dist.is_initialized() else 0} "
+                    f"failed on {num_input_tokens} input tokens, {num_labels} label tokens. "
+                    f"Step token history: {self.step_token_counts}"
+                )
                 torch.cuda.empty_cache()
             else:
-                raise e  # Re-raise if it's not an OOM error
-        
+                raise e
+
         # Synchronize OOM status across all ranks
-        # If ANY rank hit OOM, all ranks should return zero loss
         if dist.is_initialized():
             dist.all_reduce(local_oom, op=dist.ReduceOp.MAX)
-        
+
         if local_oom[0] > 0:
-            # At least one rank hit OOM - all ranks return zero loss
             if dist.is_initialized() and dist.get_rank() == 0:
-                print(f"[OOM SYNC] At least one rank hit OOM, all ranks skipping this step")
-            self.step_token_counts = []  # Reset
+                print("[OOM SYNC] At least one rank hit OOM, all ranks skipping this step")
+            self.step_token_counts = []
             torch.cuda.empty_cache()
-            return torch.tensor(0.0, device=inputs["input_ids"].device if "input_ids" in inputs else "cuda", requires_grad=True)
-        
+            return torch.tensor(
+                0.0,
+                device=inputs["input_ids"].device
+                if "input_ids" in inputs
+                else "cuda",
+                requires_grad=True,
+            )
+
         return loss
 
 
 def main():
     """
-    Train Qwen VL models (Qwen 2.x VL or Qwen 3 VL) on branch-generated trajectories.
-    
-    Example usage for Qwen 2.5 VL 7B:
-        torchrun --nproc_per_node=4 train_qwen3vl.py \\
-            --model_name_or_path Qwen/Qwen2.5-VL-7B-Instruct \\
-            --model_type qwen2_5_vl \\
-            --use_flash_attention \\
-            --batch_size 16 \\
-            --output_dir /path/to/output
-    
-    Example usage for Qwen 3 VL 8B:
-        torchrun --nproc_per_node=4 train_qwen3vl.py \\
-            --model_name_or_path Qwen/Qwen3-VL-8B-Instruct \\
-            --model_type qwen3vl \\
+    Train GLM-4.1V-9B-Base on branch-generated trajectories.
+
+    Example usage:
+        torchrun --nproc_per_node=4 train_glm41v.py \\
+            --model_name_or_path zai-org/GLM-4.1V-9B-Base \\
             --use_flash_attention \\
             --batch_size 16 \\
             --output_dir /path/to/output
@@ -904,19 +915,10 @@ def main():
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        default="Qwen/Qwen3-VL-8B-Instruct",
-        help="Model name or path to load from (e.g., Qwen/Qwen2.5-VL-7B-Instruct or Qwen/Qwen3-VL-8B-Instruct)",
-    )
-    parser.add_argument(
-        "--model_type",
-        type=str,
-        default="qwen3vl",
-        choices=["qwen2vl", "qwen2_5_vl", "qwen3vl"],
+        default="zai-org/GLM-4.1V-9B-Base",
         help=(
-            "Model type: "
-            "'qwen2vl' for Qwen 2 VL models (e.g., Qwen/Qwen2-VL-7B-Instruct), "
-            "'qwen2_5_vl' for Qwen 2.5 VL models (e.g., Qwen/Qwen2.5-VL-7B-Instruct), "
-            "or 'qwen3vl' for Qwen 3 VL models (e.g., Qwen/Qwen3-VL-8B-Instruct)."
+            "Model name or path to load from "
+            "(e.g., zai-org/GLM-4.1V-9B-Base or a local checkpoint directory)"
         ),
     )
     parser.add_argument(
@@ -926,38 +928,72 @@ def main():
         help="Directory to use for Hugging Face cache (models, tokenizers, etc.)",
     )
     parser.add_argument(
-        "--use_flash_attention", action="store_true", help="Use Flash Attention"
-    )
-    parser.add_argument("--bf16", action="store_true", help="Use BF16")
-    parser.add_argument(
-        "--output_dir", type=str, default="/gpfs/radev/home/jw3278/scratch/qwen3-vl-8b-train_new_high_lr", help="Output directory"
+        "--use_flash_attention",
+        action="store_true",
+        help="Use Flash Attention",
     )
     parser.add_argument(
-        "--save-strategy", type=str, default="steps", help="Save strategy"
-    )
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
-    parser.add_argument(
-        "--num_train_epochs", type=int, default=1, help="Number of training epochs"
-    )
-    parser.add_argument(
-        "--learning_rate", type=float, default=2e-6, help="Learning rate"
-    )
-    parser.add_argument("--wd", type=float, default=0.01, help="Weight decay")
-    parser.add_argument(
-        "--no-tqdm", dest="tqdm", action="store_false", help="Disable tqdm"
+        "--bf16",
+        action="store_true",
+        default=True,
+        help="Use BF16 (default True for GLM-4.1V)",
     )
     parser.add_argument(
-        "--tensorboard-logging", action="store_true", help="log to tensorboard"
+        "--output_dir",
+        type=str,
+        default="/gpfs/radev/home/jw3278/scratch/glm-4.1v-9b-train",
+        help="Output directory",
+    )
+    parser.add_argument(
+        "--save-strategy",
+        type=str,
+        default="steps",
+        help="Save strategy",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=16,
+        help="Batch size (global, across GPUs)",
+    )
+    parser.add_argument(
+        "--num_train_epochs",
+        type=int,
+        default=1,
+        help="Number of training epochs",
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-5,
+        help="Learning rate",
+    )
+    parser.add_argument(
+        "--wd",
+        type=float,
+        default=0.01,
+        help="Weight decay",
+    )
+    parser.add_argument(
+        "--no-tqdm",
+        dest="tqdm",
+        action="store_false",
+        help="Disable tqdm",
+    )
+    parser.add_argument(
+        "--tensorboard-logging",
+        action="store_true",
+        help="log to tensorboard",
     )
     parser.add_argument(
         "--use-google-search",
         action="store_true",
-        help="add google search in action space and prompt",
+        help="(unused here) keep parity with other scripts",
     )
     parser.add_argument(
         "--use-nogoto-gs-format",
         action="store_true",
-        help="remove gs and goto from prompt",
+        help="(unused here) keep parity with other scripts",
     )
     parser.add_argument(
         "--branch_generated_root",
@@ -966,7 +1002,7 @@ def main():
         help=(
             "Root directory containing branch-generated trajectories "
             "(each subdirectory should contain metadata.json, trajectory.jsonl, and screenshots/). "
-            "If provided, this will be used to build the training dataset instead of --train_dir."
+            "If provided, this will be used to build the training dataset."
         ),
     )
     parser.add_argument(
@@ -993,10 +1029,10 @@ def main():
     parser.add_argument(
         "--max_past_screenshots",
         type=int,
-        default=2,
+        default=0,
         help=(
             "Maximum number of past screenshots (steps) to include in the prompt, "
-            "in addition to the current step. Default is 2 to match qwen3vl_agent.py. "
+            "in addition to the current step. Default is 2. "
             "Set to 0 to only use the current screenshot."
         ),
     )
@@ -1016,7 +1052,7 @@ def main():
         "--no_dual_training_types",
         dest="dual_training_types",
         action="store_false",
-        help="Disable dual training types and only use Type 1 (original behavior)."
+        help="Disable dual training types and only use Type 1 (original behavior).",
     )
 
     args = parser.parse_args()
@@ -1037,7 +1073,6 @@ def main():
         )
         model = create_model(
             args.model_name_or_path,
-            model_type=args.model_type,
             use_flash_attention=args.use_flash_attention,
             cache_dir=args.hf_cache_dir,
         )
@@ -1058,8 +1093,8 @@ def main():
         half_verified_root=half_verified_root,
     )
 
-    # Shuffle the dataset to ensure Type 1 and Type 2 examples of the same step
-    # are not adjacent. This prevents the model from memorizing consecutive patterns.
+    # Shuffle the dataset so Type 1 and Type 2 examples of the same step
+    # are unlikely to be adjacent.
     train_dataset = train_dataset.shuffle(seed=42)
 
     print("train_dataset:", train_dataset)
@@ -1076,6 +1111,7 @@ def main():
         args.batch_size % num_gpus == 0
     ), "Batch size must be divisible by the number of GPUs"
     gradient_accumulation_steps = args.batch_size // num_gpus
+
     if args.bf16:
         fp16 = False
         bf16 = True
@@ -1083,11 +1119,10 @@ def main():
         fp16 = True
         bf16 = False
 
-    # hard coded training args
     training_args = TrainingArguments(
-        ddp_find_unused_parameters=True,
+        ddp_find_unused_parameters=False,
         num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=1,  # NOTE currently only supports batch_size == 1
+        per_device_train_batch_size=1,  # Branch collator assumes batch_size == 1
         per_device_eval_batch_size=1,
         gradient_checkpointing=True,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -1104,7 +1139,6 @@ def main():
         output_dir=args.output_dir,
         save_strategy=args.save_strategy,
         save_steps=200,
-        # save_steps=1,
         save_total_limit=7 if args.save_strategy == "steps" else None,
         save_only_model=True,
         bf16=bf16,
@@ -1113,12 +1147,14 @@ def main():
         report_to="tensorboard" if args.tensorboard_logging else "none",
         deepspeed=DS_CONFIG_DICT,
         disable_tqdm=not args.tqdm,
-        dataloader_num_workers=1,  # 4,
-        dataloader_prefetch_factor=1,  # 2,
+        dataloader_num_workers=1,
+        dataloader_prefetch_factor=1,
     )
 
-    data_collator = BranchGeneratedQwenCollator(
-        args, processor, dual_training_types=args.dual_training_types
+    data_collator = BranchGeneratedGLMCollator(
+        args,
+        processor,
+        dual_training_types=args.dual_training_types,
     )
 
     # Save a "checkpoint-0" copy of the original (pre-finetune) model & processor
@@ -1127,13 +1163,9 @@ def main():
     if accelerator.is_main_process:
         pre_ft_ckpt_dir = out_path / "checkpoint-0"
         pre_ft_ckpt_dir.mkdir(parents=True, exist_ok=True)
-        # Save the base model and processor before any training updates
         model.save_pretrained(pre_ft_ckpt_dir)
         processor.save_pretrained(pre_ft_ckpt_dir)
     accelerator.wait_for_everyone()
-
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    model = model.to(f"cuda:{local_rank}")
 
     trainer = SafeTrainer(
         model=model,
@@ -1148,3 +1180,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
